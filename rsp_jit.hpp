@@ -12,6 +12,12 @@
 #include "state.hpp"
 #include "jit_allocator.hpp"
 
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(PARALLEL_RSP_NO_VU_FAST)
+// aarch64: VU ops are emitted as register-convention bodies (rsp/vu_inline.cpp) instead of RSP_Vxxx helper calls.
+#define PRSP_VU_FAST 1
+#include "rsp/vu_inline.h"
+#endif
+
 extern "C"
 {
 #include <lightning.h>
@@ -51,6 +57,21 @@ public:
 
 	// Flush a single MIPS register.
 	void flush_mips_register(jit_state_t *_jit, unsigned mips_reg);
+
+	// Out-of-line slow paths that call C helpers: they must keep the caller-save registers that are live at the branch point.
+	// snapshot_caller_save() records them, emit_spill() / emit_reload() write the dirty ones to CPUState::sr before the call
+	// and restore all of them afterwards, without touching the cache bookkeeping of the main code path.
+	struct Saved
+	{
+		unsigned jit_reg;
+		unsigned mips_reg;
+		bool modified;
+		bool zext;
+	};
+	enum { MaxSaved = 8 };
+	unsigned snapshot_caller_save(Saved *out) const;
+	static void emit_spill(jit_state_t *_jit, const Saved *saved, unsigned count);
+	static void emit_reload(jit_state_t *_jit, const Saved *saved, unsigned count);
 
 	void reset();
 
@@ -108,6 +129,14 @@ public:
 	}
 
 	void invalidate_imem();
+
+#ifdef PRSP_VU_FAST
+	// Test hooks: choose the helper-call VU path (false) or the register-convention path before generating code.
+	void set_vu_fast(bool enable)
+	{
+		vu_fast_enabled = enable;
+	}
+#endif
 
 	CPUState &get_state()
 	{
@@ -198,6 +227,41 @@ private:
 
 	RegisterCache regs;
 	Allocator allocator;
+
+#ifdef PRSP_VU_FAST
+	struct VUStub
+	{
+		const uint32_t *src = nullptr; // body in the plugin image (without the final ret)
+		unsigned words = 0;
+		const void *addr = nullptr; // copy (with ret) in the JIT code region, reachable with BL
+		bool ok = false;
+	};
+	VUStub vu_stubs[RSP_VU_STUB_COUNT];
+	bool vu_fast_enabled = true;
+	unsigned vu_inline_words = 8; // VU bodies up to this many words are copied inline instead of called
+	int v0_holds = -1; // vector register whose value v0 currently holds (-1 = unknown)
+	void init_vu_stubs();
+	bool jit_emit_vu_fast(jit_state_t *_jit, uint32_t instr);
+
+	// Vector load / store fast paths with out-of-line slow paths (see jit_emit_ls_fast).
+	struct SlowLS
+	{
+		jit_node_t *guard;
+		jit_node_t *cont;
+		void (*helper)(CPUState *, unsigned, unsigned, unsigned);
+		unsigned rt, e, sum_reg;
+		RegisterCache::Saved saved[RegisterCache::MaxSaved];
+		unsigned num_saved;
+		int reload_v0; // vector register to reload into v0 after the helper call, or -1
+		unsigned prof_id;
+		bool inline_lqv; // handled by NEON byte shuffling instead of a helper call (LQV, e == 0, unaligned address)
+		unsigned vreg_offset; // byte offset of the destination vector register in CPUState (inline_lqv)
+		unsigned addr_reg;
+	};
+	std::vector<SlowLS> slow_ls;
+	bool jit_emit_ls_fast(jit_state_t *_jit, uint32_t instr);
+	void jit_emit_slow_paths(jit_state_t *_jit);
+#endif
 };
 } // namespace JIT
 } // namespace RSP

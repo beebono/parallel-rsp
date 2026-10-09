@@ -1,4 +1,5 @@
 #include "../state.hpp"
+#include <string.h>
 
 #ifdef PARALLEL_INTEGRATION
 #include "../rsp_1.1.h"
@@ -133,26 +134,46 @@ extern "C"
 
 		do
 		{
-			unsigned j = 0;
-			do
+			const uint32_t dest_start = dest & 0x1FFC;
+			const uint32_t source_start = source & 0x7FFFFC;
+			if ((dest_start & 0xfff) + length <= 0x1000 && source_start + length <= 0x800000)
 			{
-				uint32_t source_addr = (source + j) & 0x7FFFFC;
-				uint32_t dest_addr = (dest + j) & 0x1FFC;
-				uint32_t word = rsp->rdram[source_addr >> 2];
-
-				if (dest_addr & 0x1000)
+				// The row neither wraps in RDRAM nor straddles DMEM / IMEM: plain copy.
+				if (dest_start & 0x1000)
 				{
 					// Invalidate IMEM.
-					unsigned block = (dest_addr & 0xfff) / CODE_BLOCK_SIZE;
-					rsp->dirty_blocks |= (0x3 << block) >> 1;
-					//rsp->dirty_blocks = ~0u;
-					rsp->imem[(dest_addr & 0xfff) >> 2] = word;
+					const unsigned first = (dest_start & 0xfff) / CODE_BLOCK_SIZE;
+					const unsigned last = ((dest_start & 0xfff) + length - 1) / CODE_BLOCK_SIZE;
+					for (unsigned block = first; block <= last; block++)
+						rsp->dirty_blocks |= (0x3 << block) >> 1;
+					memcpy(rsp->imem + ((dest_start & 0xfff) >> 2), rsp->rdram + (source_start >> 2), length);
 				}
 				else
-					rsp->dmem[dest_addr >> 2] = word;
+					memcpy(rsp->dmem + (dest_start >> 2), rsp->rdram + (source_start >> 2), length);
+			}
+			else
+			{
+				unsigned j = 0;
+				do
+				{
+					uint32_t source_addr = (source + j) & 0x7FFFFC;
+					uint32_t dest_addr = (dest + j) & 0x1FFC;
+					uint32_t word = rsp->rdram[source_addr >> 2];
 
-				j += 4;
-			} while (j < length);
+					if (dest_addr & 0x1000)
+					{
+						// Invalidate IMEM.
+						unsigned block = (dest_addr & 0xfff) / CODE_BLOCK_SIZE;
+						rsp->dirty_blocks |= (0x3 << block) >> 1;
+						//rsp->dirty_blocks = ~0u;
+						rsp->imem[(dest_addr & 0xfff) >> 2] = word;
+					}
+					else
+						rsp->dmem[dest_addr >> 2] = word;
+
+					j += 4;
+				} while (j < length);
+			}
 
 			source += length + skip;
 			dest += length;
@@ -195,18 +216,28 @@ extern "C"
 		unsigned i = 0;
 		do
 		{
-			unsigned j = 0;
-
-			do
+			const uint32_t source_start = source & 0x1FFC;
+			const uint32_t dest_start = dest & 0x7FFFFC;
+			if ((source_start & 0xfff) + length <= 0x1000 && dest_start + length <= 0x800000)
 			{
-				uint32_t source_addr = (source + j) & 0x1FFC;
-				uint32_t dest_addr = (dest + j) & 0x7FFFFC;
+				const uint32_t *src = (source_start & 0x1000) ? rsp->imem + ((source_start & 0xfff) >> 2)
+				                                              : rsp->dmem + (source_start >> 2);
+				memcpy(rsp->rdram + (dest_start >> 2), src, length);
+			}
+			else
+			{
+				unsigned j = 0;
+				do
+				{
+					uint32_t source_addr = (source + j) & 0x1FFC;
+					uint32_t dest_addr = (dest + j) & 0x7FFFFC;
 
-				rsp->rdram[dest_addr >> 2] =
-				    (source_addr & 0x1000) ? rsp->imem[(source_addr & 0xfff) >> 2] : rsp->dmem[source_addr >> 2];
+					rsp->rdram[dest_addr >> 2] =
+					    (source_addr & 0x1000) ? rsp->imem[(source_addr & 0xfff) >> 2] : rsp->dmem[source_addr >> 2];
 
-				j += 4;
-			} while (j < length);
+					j += 4;
+				} while (j < length);
+			}
 
 			source += length;
 			dest += length + skip;

@@ -1,7 +1,12 @@
 #include "rsp_jit.hpp"
 #include "rsp_disasm.hpp"
+#include <stdio.h>
+#include <stdlib.h>
 #include <utility>
 #include <assert.h>
+#ifdef PRSP_VU_FAST
+#include "rsp/neon_enc.h"
+#endif
 
 using namespace std;
 
@@ -26,6 +31,68 @@ using namespace std;
 #define jit_ldxi_ui jit_ldxi_i
 #endif
 
+
+#ifdef PRSP_PROFILE
+// Dynamic instruction-mix profiler (build with -DPRSP_PROFILE): every JIT-ed instruction calls prsp_prof_hit(id).
+#include <stdio.h>
+#include <stdio.h>
+#include <stdlib.h>
+static uint64_t prsp_prof_cnt[2048];
+static uint64_t prsp_prof_slow_detail[2][12][16][16]; // [store][op][e][addr & 15]
+static uint64_t prsp_prof_run_vu[64], prsp_prof_run_vl[64], prsp_prof_enter;
+static unsigned prsp_prof_cur_vu, prsp_prof_cur_vl;
+static uint64_t prsp_prof_total;
+static void prsp_prof_dump()
+{
+	const char *f = getenv("PRSP_PROF_OUT");
+	if (!f) return;
+	FILE *o = fopen(f, "w");
+	if (!o) return;
+	fprintf(o, "total %llu\nenter %llu\n", (unsigned long long)prsp_prof_total, (unsigned long long)prsp_prof_enter);
+	for (unsigned i = 0; i < 2048; i++) if (prsp_prof_cnt[i]) fprintf(o, "op %u %llu\n", i, (unsigned long long)prsp_prof_cnt[i]);
+	for (unsigned a = 0; a < 2; a++) for (unsigned b = 0; b < 12; b++) for (unsigned c = 0; c < 16; c++) for (unsigned d = 0; d < 16; d++)
+		if (prsp_prof_slow_detail[a][b][c][d]) fprintf(o, "slow %u %u %u %u %llu\n", a, b, c, d, (unsigned long long)prsp_prof_slow_detail[a][b][c][d]);
+	for (unsigned i = 0; i < 64; i++) if (prsp_prof_run_vu[i]) fprintf(o, "runvu %u %llu\n", i, (unsigned long long)prsp_prof_run_vu[i]);
+	for (unsigned i = 0; i < 64; i++) if (prsp_prof_run_vl[i]) fprintf(o, "runvl %u %llu\n", i, (unsigned long long)prsp_prof_run_vl[i]);
+	fclose(o);
+}
+extern "C" void prsp_prof_slow(unsigned store, unsigned op, unsigned e, unsigned addr)
+{
+	prsp_prof_slow_detail[store][op][e][addr & 15]++;
+}
+extern "C" void prsp_prof_hit(unsigned id)
+{
+	prsp_prof_cnt[id]++;
+	bool vu = id < 1024, ls = id >= 1024 && id < 1088;
+	if (vu) prsp_prof_cur_vu++; else { if (prsp_prof_cur_vu) prsp_prof_run_vu[prsp_prof_cur_vu > 63 ? 63 : prsp_prof_cur_vu]++; prsp_prof_cur_vu = 0; }
+	if (vu || ls) prsp_prof_cur_vl++; else { if (prsp_prof_cur_vl) prsp_prof_run_vl[prsp_prof_cur_vl > 63 ? 63 : prsp_prof_cur_vl]++; prsp_prof_cur_vl = 0; }
+	if ((++prsp_prof_total & ((1u << 24) - 1)) == 0) prsp_prof_dump();
+}
+#endif
+
+// Debugging aid: PRSP_DUMP_JIT=<file> writes an image of the code region (file offset = address - first code address) for use with
+// objdump -D -b binary -m aarch64 together with perf samples.
+static void dump_code(const void *code, size_t size)
+{
+	static FILE *dump = nullptr;
+	static bool dump_init = false;
+	static uintptr_t base = 0;
+	if (!dump_init)
+	{
+		dump_init = true;
+		base = reinterpret_cast<uintptr_t>(code);
+		const char *path = getenv("PRSP_DUMP_JIT");
+		if (path && *path)
+			dump = fopen(path, "wb");
+	}
+	if (dump)
+	{
+		fseek(dump, long(reinterpret_cast<uintptr_t>(code) - base), SEEK_SET);
+		fwrite(code, 1, size, dump);
+		fflush(dump);
+	}
+}
+
 namespace RSP
 {
 namespace JIT
@@ -34,6 +101,14 @@ CPU::CPU()
 {
 	init_jit("RSP");
 	init_jit_thunks();
+#ifdef PRSP_VU_FAST
+	const char *slow = getenv("PRSP_NO_VU_FAST");
+	if (slow && *slow && *slow != '0')
+		vu_fast_enabled = false;
+	if (const char *iw = getenv("PRSP_INLINE_WORDS"))
+		vu_inline_words = unsigned(atoi(iw));
+	init_vu_stubs();
+#endif
 }
 
 CPU::~CPU()
@@ -236,6 +311,9 @@ extern "C"
 #define BYTE_ENDIAN_FIXUP(x, off) ((((x) + (off)) ^ 3) & 0xfffu)
 	static Func rsp_enter(void *cpu, unsigned pc)
 	{
+#ifdef PRSP_PROFILE
+		prsp_prof_enter++;
+#endif
 		return static_cast<CPU *>(cpu)->get_jit_block(pc);
 	}
 
@@ -306,6 +384,523 @@ extern "C"
 	}
 #endif
 }
+
+
+#ifdef PRSP_VU_FAST
+// Validates a copied-in VU body: straight-line NEON / load-store code that only touches CPUState through x19 and only uses
+// scratch registers (x0-x8, x16, x17). Returns the number of words before the terminating ret, or 0 when the body is not usable.
+static unsigned validate_vu_body(const uint32_t *w)
+{
+	const unsigned max_words = 160;
+	// Scratch registers a body may write: x0-x8, x16, x17 (31 = xzr as a destination or source).
+	auto scratch_ok = [](unsigned r) { return r <= 8 || r == 16 || r == 17 || r == 31; };
+	auto src_ok = [&](unsigned r) { return scratch_ok(r) || r == 19; };
+	for (unsigned i = 0; i < max_words; i++)
+	{
+		uint32_t x = w[i];
+		if (x == 0xd65f03c0u) // ret
+			return i;
+		if ((x & 0x1c000000u) == 0x14000000u) // any branch / system instruction
+			return 0;
+		if ((x & 0x1f000000u) == 0x10000000u) // adr / adrp
+			return 0;
+		const unsigned rd = x & 31, rn = (x >> 5) & 31, rm = (x >> 16) & 31, rt2 = (x >> 10) & 31;
+		if ((x & 0x0a000000u) == 0x08000000u) // loads and stores
+		{
+			if ((x & 0x3b000000u) == 0x18000000u) // literal
+				return 0;
+			if (rn == 31 || !src_ok(rn)) // base register: the state in x19 or a scratch register, never sp
+				return 0;
+			const bool simd = (x >> 26) & 1;
+			if (!simd && !scratch_ok(rd))
+				return 0;
+			if (!simd && (x & 0x38000000u) == 0x28000000u && !scratch_ok(rt2)) // pair
+				return 0;
+			if ((x & 0x3b200c00u) == 0x38200800u && !src_ok(rm)) // register offset
+				return 0;
+		}
+		else if ((x & 0x1c000000u) == 0x10000000u) // data processing, immediate
+		{
+			const unsigned kind = (x >> 23) & 7;
+			if (kind == 2) // add / sub immediate: sp is not allowed on either side
+			{
+				if (rd == 31 || rn == 31 || !scratch_ok(rd) || !src_ok(rn))
+					return 0;
+			}
+			else if (kind == 5) // move wide
+			{
+				if (!scratch_ok(rd) || rd == 31)
+					return 0;
+			}
+			else if (!scratch_ok(rd) || !src_ok(rn)) // logical immediate, bitfield, extract
+				return 0;
+			if (kind == 4 && rd == 31) // logical immediate writing sp
+				return 0;
+		}
+		else if ((x & 0x0e000000u) == 0x0a000000u) // data processing, register
+		{
+			if (!scratch_ok(rd) || !src_ok(rn) || !src_ok(rm))
+				return 0;
+		}
+		// else: SIMD & FP data processing; operates on vector registers (scalar destinations are covered by -ffixed-x*).
+	}
+	return 0;
+}
+
+void CPU::init_vu_stubs()
+{
+	unsigned total = 0;
+	const char *dbg = getenv("PRSP_DEBUG_VU");
+	for (unsigned i = 0; i < RSP_VU_STUB_COUNT; i++)
+	{
+		auto &st = vu_stubs[i];
+		st.src = static_cast<const uint32_t *>(rsp_vu_stub_fn[i]);
+		st.words = validate_vu_body(st.src);
+		st.ok = st.words != 0;
+		if (st.ok)
+			total += st.words + 1;
+		if (dbg)
+			fprintf(stderr, "vu stub %-8s %s %u words\n", rsp_vu_stub_name[i], st.ok ? "ok    " : "REJECT", st.words);
+	}
+	if (!total)
+		return;
+
+	auto *area = static_cast<uint32_t *>(allocator.allocate_code(total * sizeof(uint32_t)));
+	if (!area)
+		abort();
+	unsigned pos = 0;
+	for (unsigned i = 0; i < RSP_VU_STUB_COUNT; i++)
+	{
+		auto &st = vu_stubs[i];
+		if (!st.ok)
+			continue;
+		memcpy(area + pos, st.src, st.words * sizeof(uint32_t));
+		area[pos + st.words] = 0xd65f03c0u; // ret
+		st.addr = area + pos;
+		pos += st.words + 1;
+	}
+	dump_code(area, total * sizeof(uint32_t));
+	__builtin___clear_cache(reinterpret_cast<char *>(area), reinterpret_cast<char *>(area + total));
+	if (!Allocator::commit_code(area, total * sizeof(uint32_t)))
+		abort();
+}
+
+bool CPU::jit_emit_vu_fast(jit_state_t *_jit, uint32_t instr)
+{
+	using namespace NeonEnc;
+	// -1: not handled here, -2: nothing to emit (VNOP), -3: VSAR, -4: VMOV, -5: VRCPH / VRSQH, otherwise RSPVUStubId.
+	static const int8_t map[64] = {
+		RSP_VUS_ID_VMULF, RSP_VUS_ID_VMULU, -1, -1, RSP_VUS_ID_VMUDL, RSP_VUS_ID_VMUDM, RSP_VUS_ID_VMUDN, RSP_VUS_ID_VMUDH,
+		RSP_VUS_ID_VMACF, RSP_VUS_ID_VMACU, -1, -1, RSP_VUS_ID_VMADL, RSP_VUS_ID_VMADM, RSP_VUS_ID_VMADN, RSP_VUS_ID_VMADH,
+		RSP_VUS_ID_VADD, RSP_VUS_ID_VSUB, RSP_VUS_ID_RESERVED, RSP_VUS_ID_VABS, RSP_VUS_ID_VADDC, RSP_VUS_ID_VSUBC,
+		RSP_VUS_ID_RESERVED, RSP_VUS_ID_RESERVED, RSP_VUS_ID_RESERVED, RSP_VUS_ID_RESERVED, RSP_VUS_ID_RESERVED,
+		RSP_VUS_ID_RESERVED, RSP_VUS_ID_RESERVED, -3, RSP_VUS_ID_RESERVED, RSP_VUS_ID_RESERVED,
+		RSP_VUS_ID_VLT, RSP_VUS_ID_VEQ, RSP_VUS_ID_VNE, RSP_VUS_ID_VGE, RSP_VUS_ID_VCL, RSP_VUS_ID_VCH, RSP_VUS_ID_VCR,
+		RSP_VUS_ID_VMRG, RSP_VUS_ID_VAND, RSP_VUS_ID_VNAND, RSP_VUS_ID_VOR, RSP_VUS_ID_VNOR, RSP_VUS_ID_VXOR, RSP_VUS_ID_VNXOR,
+		RSP_VUS_ID_RESERVED, RSP_VUS_ID_RESERVED, -1, -1, -5, -4, -1, -1, -5,
+		-2, RSP_VUS_ID_RESERVED, RSP_VUS_ID_RESERVED, RSP_VUS_ID_RESERVED, RSP_VUS_ID_RESERVED, RSP_VUS_ID_RESERVED,
+		RSP_VUS_ID_RESERVED, RSP_VUS_ID_RESERVED, -2,
+	};
+
+	const uint32_t op = instr & 63;
+	const unsigned vd = (instr >> 6) & 31;
+	const unsigned vs = (instr >> 11) & 31;
+	const unsigned vt = (instr >> 16) & 31;
+	const unsigned e = (instr >> 21) & 15;
+	const int id = map[op];
+	if (id == -1)
+		return false;
+	if (id == -2)
+		return true;
+
+	const unsigned reg_base = offsetof(CPUState, cp2) + offsetof(CP2, regs);
+	const unsigned acc_base = offsetof(CPUState, cp2) + offsetof(CP2, acc);
+#define RAW(w) jit_raw(w)
+
+	// Element-shuffles v1 in place (same permutation as shuffle_keys[e] in rsp_core.cpp).
+	auto emit_vt_shuffle = [&](unsigned el) {
+		if (el >= 8)
+			RAW(dup_8h(1, 1, el - 8));
+		else if (el >= 2)
+		{
+			// q and h broadcasts out of two transposes.
+			if (el < 4) // 0q, 1q
+				RAW(el == 2 ? trn1_8h(1, 1, 1) : trn2_8h(1, 1, 1));
+			else // 0h .. 3h
+			{
+				RAW((el & 1) == 0 ? trn1_8h(1, 1, 1) : trn2_8h(1, 1, 1));
+				RAW((el & 2) == 0 ? trn1_4s(1, 1, 1) : trn2_4s(1, 1, 1));
+			}
+		}
+	};
+
+	if (id == -3)
+	{
+		// VSAR: vd = one accumulator slice (e = 8, 9, 10: hi, md, lo), otherwise zero.
+		if (e >= 8 && e <= 10)
+			RAW(ldr_q(0, 19, acc_base + (e - 8) * 16));
+		else
+			RAW(movi_zero(0));
+		RAW(str_q(0, 19, reg_base + vd * 16));
+		v0_holds = int(vd);
+		return true;
+	}
+
+	if (id == -4)
+	{
+		// VMOV: acc_lo = shuffled vt, then vd.e[de] = acc_lo.e[de] with de = the vs field & 7.
+		const unsigned de = vs & 7;
+		if (int(vt) == v0_holds)
+			RAW(mov16b(1, 0));
+		else
+			RAW(ldr_q(1, 19, reg_base + vt * 16));
+		emit_vt_shuffle(e);
+		RAW(str_q(1, 19, acc_base + 32));
+		RAW(ldrh(16, 19, acc_base + 32 + 2 * de));
+		RAW(strh(16, 19, reg_base + vd * 16 + 2 * de));
+		if (int(vd) == v0_holds)
+			v0_holds = -1;
+		return true;
+	}
+
+	if (id == -5)
+	{
+		// VRCPH / VRSQH: acc_lo = shuffled vt, dp_flag = 1, div_in = vt.e[e & 7], vd.e[de] = div_out.
+		const unsigned de = vs & 7;
+		const unsigned cp2 = offsetof(CPUState, cp2);
+		if (int(vt) == v0_holds)
+			RAW(mov16b(1, 0));
+		else
+			RAW(ldr_q(1, 19, reg_base + vt * 16));
+		emit_vt_shuffle(e);
+		RAW(str_q(1, 19, acc_base + 32));
+		RAW(ldrh(16, 19, reg_base + vt * 16 + 2 * (e & 7)));
+		RAW(strh(16, 19, cp2 + offsetof(CP2, div_in)));
+		RAW(0x52800031u); // mov w17, #1
+		RAW(strb(17, 19, cp2 + offsetof(CP2, dp_flag)));
+		RAW(ldrh(16, 19, cp2 + offsetof(CP2, div_out)));
+		RAW(strh(16, 19, reg_base + vd * 16 + 2 * de));
+		if (int(vd) == v0_holds)
+			v0_holds = -1;
+		return true;
+	}
+
+	const auto &st = vu_stubs[id];
+	if (!st.ok)
+		return false;
+
+	// vt (element-shuffled) goes to v1, vs to v0. Take vt from v0 first when that is where it lives.
+	if (int(vt) == v0_holds)
+		RAW(mov16b(1, 0));
+	else
+		RAW(ldr_q(1, 19, reg_base + vt * 16));
+	if (int(vs) != v0_holds)
+		RAW(ldr_q(0, 19, reg_base + vs * 16));
+
+	emit_vt_shuffle(e);
+
+	if (st.words <= vu_inline_words)
+	{
+		for (unsigned i = 0; i < st.words; i++)
+			RAW(st.src[i]);
+	}
+	else
+	{
+		jit_prepare();
+		jit_finishi(const_cast<void *>(st.addr));
+	}
+	RAW(str_q(0, 19, reg_base + vd * 16));
+	v0_holds = int(vd);
+#undef RAW
+	return true;
+}
+
+// Physical register number of a Lightning register, for raw instruction words.
+static inline unsigned phys_reg(unsigned jit_reg)
+{
+	if (jit_reg >= unsigned(JIT_R0) && jit_reg < unsigned(JIT_R(JIT_R_NUM)))
+		return 9 + (jit_reg - unsigned(JIT_R0));
+	assert(jit_reg >= unsigned(JIT_V0) && jit_reg < unsigned(JIT_V(JIT_V_NUM)));
+	return 19 + (jit_reg - unsigned(JIT_V0));
+}
+
+bool CPU::jit_emit_ls_fast(jit_state_t *_jit, uint32_t instr)
+{
+	using namespace NeonEnc;
+	const bool store = (instr >> 26) == 072;
+	const unsigned rt = (instr >> 16) & 31;
+	int simm = int(int16_t(instr << 9)) >> 9; // 7-bit signed offset
+	const unsigned rs = (instr >> 21) & 31;
+	const unsigned op = (instr >> 11) & 31;
+	const unsigned e = (instr >> 7) & 15;
+
+	unsigned scale, mask;
+	void (*helper)(CPUState *, unsigned, unsigned, unsigned);
+	switch (op)
+	{
+	case 0: // LBV / SBV: always handled inline, no slow path
+		scale = 1; mask = 0;
+		helper = nullptr;
+		break;
+	case 1: // LSV / SSV
+		if (e & 1)
+			return false;
+		scale = 2; mask = 1;
+		helper = store ? RSP_SSV_A : RSP_LSV_A;
+		break;
+	case 2: // LLV / SLV
+		if ((e & 1) || e > 12)
+			return false;
+		scale = 4; mask = 3;
+		helper = store ? RSP_SLV_A : RSP_LLV_A;
+		break;
+	case 3: // LDV / SDV
+		if ((e & 1) || e > 8)
+			return false;
+		scale = 8; mask = 7;
+		helper = store ? RSP_SDV_A : RSP_LDV_A;
+		break;
+	case 4: // LQV / SQV
+		if (store ? (e & 1) : (e != 0))
+			return false;
+		scale = 16; mask = 15;
+		helper = store ? RSP_SQV_A : RSP_LQV_A;
+		break;
+	case 6: // LPV / SPV
+	case 7: // LUV / SUV
+		if (e != 0)
+			return false;
+		scale = 8; mask = 7;
+		if (op == 6)
+			helper = store ? RSP_SPV_A : RSP_LPV_A;
+		else
+			helper = store ? RSP_SUV_A : RSP_LUV_A;
+		break;
+	default:
+		return false;
+	}
+
+	const unsigned reg_base = offsetof(CPUState, cp2) + offsetof(CP2, regs);
+	const unsigned V = reg_base + rt * 16;
+
+	unsigned rs_reg = regs.load_mips_register_noext(_jit, rs);
+	unsigned sum = regs.modify_mips_register(_jit, RegisterCache::SCRATCH_REGISTER0);
+	jit_addi(sum, rs_reg, simm * int(scale));
+	regs.unlock_mips_register(rs);
+	unsigned A = regs.modify_mips_register(_jit, RegisterCache::SCRATCH_REGISTER1);
+	jit_andi(A, sum, 0xfffu);
+	jit_node_t *guard = mask ? jit_bmsi(A, mask) : nullptr;
+	const unsigned X = phys_reg(A);
+
+#define RAW(w) jit_raw(w)
+	// Access to a vector register at byte offset V + e with natural alignment `align`: scaled immediate when aligned, otherwise through x17.
+	auto vaddr = [&](unsigned align, unsigned &base, unsigned &off) {
+		if (((V + e) % align) == 0)
+		{
+			base = 19;
+			off = V + e;
+		}
+		else
+		{
+			RAW(add_imm(17, 19, V + e));
+			base = 17;
+			off = 0;
+		}
+	};
+	unsigned b, o;
+
+	switch (op)
+	{
+	case 0:
+		jit_xori(A, A, 3);
+		if (store)
+		{
+			RAW(ldrb(16, 19, V + (e ^ 1)));
+			RAW(strb_r(16, 20, X));
+		}
+		else
+		{
+			RAW(ldrb_r(16, 20, X));
+			RAW(strb(16, 19, V + (e ^ 1)));
+		}
+		break;
+
+	case 1:
+		jit_xori(A, A, 2);
+		if (store)
+		{
+			RAW(ldrh(16, 19, V + e));
+			RAW(strh_r(16, 20, X));
+		}
+		else
+		{
+			RAW(ldrh_r(16, 20, X));
+			RAW(strh(16, 19, V + e));
+		}
+		break;
+
+	case 2:
+		if (store)
+		{
+			vaddr(4, b, o);
+			RAW(ldr_w(16, b, o));
+			RAW(ror16_w(16, 16));
+			RAW(str_w_r(16, 20, X));
+		}
+		else
+		{
+			RAW(ldr_w_r(16, 20, X));
+			RAW(ror16_w(16, 16));
+			vaddr(4, b, o);
+			RAW(str_w(16, b, o));
+		}
+		break;
+
+	case 3:
+		if (store)
+		{
+			vaddr(8, b, o);
+			RAW(ldr_d(2, b, o));
+			RAW(rev32_4h(2, 2));
+			RAW(str_d_r(2, 20, X));
+		}
+		else
+		{
+			RAW(ldr_d_r(2, 20, X));
+			RAW(rev32_4h(2, 2));
+			vaddr(8, b, o);
+			RAW(str_d(2, b, o));
+		}
+		break;
+
+	case 4:
+		if (store)
+		{
+			RAW(ldr_q(2, 19, V));
+			if (e)
+				RAW(ext_16b(2, 2, 2, e));
+			RAW(rev32_8h(2, 2));
+			RAW(str_q_r(2, 20, X));
+		}
+		else
+		{
+			RAW(ldr_q_r(2, 20, X));
+			RAW(rev32_8h(2, 2));
+			RAW(str_q(2, 19, V));
+		}
+		break;
+
+	case 6:
+	case 7:
+		if (store)
+		{
+			RAW(ldr_q(2, 19, V));
+			RAW(shrn_8b(2, 2, op == 6 ? 8 : 7));
+			RAW(rev32_8b(2, 2));
+			RAW(str_d_r(2, 20, X));
+		}
+		else
+		{
+			RAW(ldr_d_r(2, 20, X));
+			RAW(rev32_8b(2, 2));
+			RAW(op == 6 ? shll_8h_8(2, 2) : ushll_8h_7(2, 2));
+			RAW(str_q(2, 19, V));
+		}
+		break;
+	}
+#undef RAW
+
+	// Loads change the vector register; v0 stays valid unless it caches that very register.
+	if (!store && int(rt) == v0_holds)
+		v0_holds = -1;
+
+	if (!guard)
+	{
+		regs.unlock_mips_register(RegisterCache::SCRATCH_REGISTER0);
+		regs.unlock_mips_register(RegisterCache::SCRATCH_REGISTER1);
+		return true;
+	}
+
+	jit_node_t *cont = jit_label();
+
+	SlowLS sl;
+	sl.guard = guard;
+	sl.cont = cont;
+	sl.helper = helper;
+	sl.rt = rt;
+	sl.e = e;
+	sl.sum_reg = sum;
+	sl.num_saved = regs.snapshot_caller_save(sl.saved);
+	sl.reload_v0 = v0_holds;
+	sl.prof_id = 1400 + (store ? 32 : 0) + op;
+	sl.inline_lqv = !store && op == 4 && e == 0;
+	sl.vreg_offset = V;
+	sl.addr_reg = A;
+	slow_ls.push_back(sl);
+
+	regs.unlock_mips_register(RegisterCache::SCRATCH_REGISTER0);
+	regs.unlock_mips_register(RegisterCache::SCRATCH_REGISTER1);
+	return true;
+}
+
+void CPU::jit_emit_slow_paths(jit_state_t *_jit)
+{
+	using namespace NeonEnc;
+	const unsigned reg_base = offsetof(CPUState, cp2) + offsetof(CP2, regs);
+	for (auto &sl : slow_ls)
+	{
+		jit_node_t *slow = jit_label();
+		jit_patch_at(sl.guard, slow);
+		if (sl.inline_lqv)
+		{
+			// LQV, e == 0, address not 16-byte aligned: load the 16 - (addr & 15) bytes up to the next boundary into the first
+			// bytes of the vector, leave the rest. Work on RSP byte order: rev32.16b turns the DMEM block into byte order, rev16.16b
+			// converts the (big-endian lane) vector image to and from it.
+			const unsigned m = phys_reg(sl.sum_reg), X = phys_reg(sl.addr_reg);
+			const unsigned iota = offsetof(CPUState, iota);
+			jit_andi(sl.sum_reg, sl.addr_reg, 15);
+			jit_andi(sl.addr_reg, sl.addr_reg, 0xff0);
+			jit_raw(dup_16b_w(3, m));
+			jit_raw(ldr_q_r(1, 20, X));
+			jit_raw(rev32_16b(1, 1));
+			jit_raw(ldr_q(2, 19, iota));
+			jit_raw(add_16b(2, 2, 3)); // source byte for each destination byte: j + m
+			jit_raw(tbl_16b(1, 1, 2)); // out of range (j >= 16 - m) gives 0
+			jit_raw(ldr_q(4, 19, sl.vreg_offset));
+			jit_raw(rev16_16b(4, 4));
+			jit_raw(movi_16b(5, 16));
+			jit_raw(cmhi_16b(5, 5, 2)); // 16 > j + m: take the loaded byte
+			jit_raw(bsl_16b(5, 1, 4));
+			jit_raw(rev16_16b(5, 5));
+			jit_raw(str_q(5, 19, sl.vreg_offset));
+			jit_patch_at(jit_jmpi(), sl.cont);
+			continue;
+		}
+#ifdef PRSP_PROFILE
+		RegisterCache::emit_spill(_jit, sl.saved, sl.num_saved);
+		jit_begin_call(_jit);
+		jit_pushargi(sl.prof_id >= 1432 ? 1 : 0);
+		jit_pushargi(sl.prof_id - (sl.prof_id >= 1432 ? 1432 : 1400));
+		jit_pushargi(sl.e);
+		jit_pushargr(sl.sum_reg);
+		jit_end_call(_jit, reinterpret_cast<jit_pointer_t>(prsp_prof_slow));
+		RegisterCache::emit_reload(_jit, sl.saved, sl.num_saved);
+#endif
+		RegisterCache::emit_spill(_jit, sl.saved, sl.num_saved);
+		jit_begin_call(_jit);
+		jit_pushargr(JIT_REGISTER_STATE);
+		jit_pushargi(sl.rt);
+		jit_pushargi(sl.e);
+		jit_pushargr(sl.sum_reg);
+		jit_end_call(_jit, reinterpret_cast<jit_pointer_t>(sl.helper));
+		RegisterCache::emit_reload(_jit, sl.saved, sl.num_saved);
+		if (sl.reload_v0 >= 0)
+			jit_raw(ldr_q(0, 19, reg_base + sl.reload_v0 * 16));
+		jit_patch_at(jit_jmpi(), sl.cont);
+	}
+	slow_ls.clear();
+}
+#endif
 
 void CPU::jit_save_indirect_register(jit_state_t *_jit, unsigned mips_register)
 {
@@ -400,11 +995,27 @@ void CPU::init_jit_thunks()
 	}
 #endif
 
+#ifdef PRSP_VU_FAST
+	// Inline lookup in CPU::blocks[]: only blocks that are not compiled yet go through rsp_enter().
+	auto *have_block = ({
+		jit_andi(JIT_R2, JIT_REGISTER_NEXT_PC, (IMEM_SIZE - 1) & ~3u);
+		jit_lshi(JIT_R2, JIT_R2, 1);
+		jit_addr(JIT_R2, JIT_R2, JIT_REGISTER_STATE);
+		jit_ldxi(JIT_R2, JIT_R2, offsetof(CPU, blocks));
+		jit_bnei(JIT_R2, 0);
+	});
+#endif
 	jit_prepare();
 	jit_pushargr(JIT_REGISTER_STATE);
 	jit_pushargr(JIT_REGISTER_NEXT_PC);
 	jit_finishi(reinterpret_cast<jit_pointer_t>(rsp_enter));
 	jit_retval(JIT_REGISTER_NEXT_PC);
+#ifdef PRSP_VU_FAST
+	auto *block_ready = jit_jmpi();
+	jit_patch(have_block);
+	jit_movr(JIT_REGISTER_NEXT_PC, JIT_R2);
+	jit_patch(block_ready);
+#endif
 
 	// Jump to thunk.
 
@@ -432,6 +1043,7 @@ void CPU::init_jit_thunks()
 	jit_set_code(thunk_code, code_size);
 
 	thunks.enter_frame = reinterpret_cast<int (*)(void *)>(jit_emit());
+	dump_code(thunk_code, code_size);
 	thunks.enter_thunk = jit_address(entry_label);
 	thunks.return_thunk = jit_address(return_label);
 
@@ -861,6 +1473,24 @@ void CPU::jit_instruction(jit_state_t *_jit, uint32_t pc, uint32_t instr,
 	jit_end_call(_jit, reinterpret_cast<jit_pointer_t>(rsp_report_pc));
 #endif
 
+#ifdef PRSP_PROFILE
+	{
+		unsigned pid;
+		if ((instr >> 25) == 0x25) pid = (instr & 63) * 16 + ((instr >> 21) & 15);
+		else if ((instr >> 26) == 062) pid = 1024 + ((instr >> 11) & 31);
+		else if ((instr >> 26) == 072) pid = 1056 + ((instr >> 11) & 31);
+		else if ((instr >> 26) == 022) pid = 1088 + ((instr >> 21) & 31);
+		else if ((instr >> 26) == 020) pid = (((instr >> 21) & 31) == 0 ? 1500 : 1532) + ((instr >> 11) & 15);
+		else if ((instr >> 26) == 0) pid = 1216 + (instr & 63);
+		else if ((instr >> 26) == 1) pid = 1280 + ((instr >> 16) & 31);
+		else pid = 1152 + (instr >> 26);
+		regs.flush_caller_save_registers(_jit);
+		jit_begin_call(_jit);
+		jit_pushargi(pid);
+		jit_end_call(_jit, reinterpret_cast<jit_pointer_t>(prsp_prof_hit));
+	}
+#endif
+
 	// VU
 	if ((instr >> 25) == 0x25)
 	{
@@ -870,6 +1500,12 @@ void CPU::jit_instruction(jit_state_t *_jit, uint32_t pc, uint32_t instr,
 		uint32_t vs = (instr >> 11) & 31;
 		uint32_t vt = (instr >> 16) & 31;
 		uint32_t e = (instr >> 21) & 15;
+
+#ifdef PRSP_VU_FAST
+		if (vu_fast_enabled && jit_emit_vu_fast(_jit, instr))
+			return;
+		v0_holds = -1;
+#endif
 
 		using VUOp = void (*)(RSP::CPUState *, unsigned vd, unsigned vs, unsigned vt, unsigned e);
 
@@ -896,6 +1532,29 @@ void CPU::jit_instruction(jit_state_t *_jit, uint32_t pc, uint32_t instr,
 		jit_end_call(_jit ,reinterpret_cast<jit_pointer_t>(vuop));
 		return;
 	}
+
+#ifdef PRSP_VU_FAST
+	// v0 survives pure scalar ALU instructions and branches; anything else may call a helper or modify a vector register.
+	{
+		uint32_t t = instr >> 26;
+		if ((t == 062 || t == 072) && vu_fast_enabled && jit_emit_ls_fast(_jit, instr))
+			return;
+		bool keeps_v0 = t <= 7 || (t >= 010 && t <= 017);
+		if (t == 022 && vu_fast_enabled)
+		{
+			unsigned sub = (instr >> 21) & 31;
+			keeps_v0 = sub == 000 || sub == 004; // MFC2 / MTC2 are inlined below (MTC2 invalidates v0 itself when needed)
+		}
+		else if (t == 020 && vu_fast_enabled)
+		{
+			unsigned sub = (instr >> 21) & 31, rd15 = (instr >> 11) & 15;
+			keeps_v0 = (sub == 000 && rd15 != CP0_REGISTER_SP_STATUS) ||
+			           (sub == 004 && (rd15 == CP0_REGISTER_DMA_CACHE || rd15 == CP0_REGISTER_DMA_DRAM));
+		}
+		if (!keeps_v0)
+			v0_holds = -1;
+	}
+#endif
 
 	// TODO: Meaningful register allocation.
 	// For now, always flush register state to memory after an instruction for simplicity.
@@ -1439,6 +2098,22 @@ void CPU::jit_instruction(jit_state_t *_jit, uint32_t pc, uint32_t instr,
 		{
 		case 000: // MFC0
 		{
+#ifdef PRSP_VU_FAST
+			// Every CP0 register except SP_STATUS (which has the polling time-out logic) is a plain read of *cr[rd].
+			if (vu_fast_enabled && (rd & 15) != CP0_REGISTER_SP_STATUS)
+			{
+				if (rt != 0)
+				{
+					unsigned ptr = regs.modify_mips_register(_jit, RegisterCache::SCRATCH_REGISTER0);
+					jit_ldxi(ptr, JIT_REGISTER_STATE, offsetof(CPUState, cp0) + offsetof(CP0, cr) + sizeof(uint32_t *) * (rd & 15));
+					unsigned rt_reg = regs.modify_mips_register(_jit, rt);
+					jit_ldxi_i(rt_reg, ptr, 0);
+					regs.unlock_mips_register(rt);
+					regs.unlock_mips_register(RegisterCache::SCRATCH_REGISTER0);
+				}
+				break;
+			}
+#endif
 			regs.flush_register_window(_jit);
 
 			jit_begin_call(_jit);
@@ -1457,6 +2132,22 @@ void CPU::jit_instruction(jit_state_t *_jit, uint32_t pc, uint32_t instr,
 
 		case 004: // MTC0
 		{
+#ifdef PRSP_VU_FAST
+			// DMA_CACHE and DMA_DRAM only mask and store.
+			if (vu_fast_enabled && ((rd & 15) == CP0_REGISTER_DMA_CACHE || (rd & 15) == CP0_REGISTER_DMA_DRAM))
+			{
+				unsigned rt_reg = regs.load_mips_register_noext(_jit, rt);
+				unsigned ptr = regs.modify_mips_register(_jit, RegisterCache::SCRATCH_REGISTER0);
+				jit_ldxi(ptr, JIT_REGISTER_STATE, offsetof(CPUState, cp0) + offsetof(CP0, cr) + sizeof(uint32_t *) * (rd & 15));
+				unsigned val = regs.modify_mips_register(_jit, RegisterCache::SCRATCH_REGISTER1);
+				jit_andi(val, rt_reg, (rd & 15) == CP0_REGISTER_DMA_CACHE ? 0x1fffu : 0xffffffu);
+				jit_stxi_i(0, ptr, val);
+				regs.unlock_mips_register(rt);
+				regs.unlock_mips_register(RegisterCache::SCRATCH_REGISTER0);
+				regs.unlock_mips_register(RegisterCache::SCRATCH_REGISTER1);
+				break;
+			}
+#endif
 			regs.flush_register_window(_jit);
 
 			jit_begin_call(_jit);
@@ -1490,6 +2181,35 @@ void CPU::jit_instruction(jit_state_t *_jit, uint32_t pc, uint32_t instr,
 		{
 		case 000: // MFC2
 		{
+#ifdef PRSP_VU_FAST
+			if (vu_fast_enabled)
+			{
+				// vd lane(s) -> sr[rt], sign extended; no helper call.
+				const unsigned V = offsetof(CPUState, cp2) + offsetof(CP2, regs) + rd * 16;
+				if (rt == 0)
+					break;
+				if ((imm & 1) == 0)
+				{
+					unsigned rt_reg = regs.modify_mips_register(_jit, rt);
+					jit_ldxi_s(rt_reg, JIT_REGISTER_STATE, V + imm);
+					regs.unlock_mips_register(rt);
+				}
+				else
+				{
+					const unsigned lo = imm >> 1, hi = ((imm + 1) >> 1) & 7;
+					unsigned tmp = regs.modify_mips_register(_jit, RegisterCache::SCRATCH_REGISTER0);
+					unsigned rt_reg = regs.modify_mips_register(_jit, rt);
+					jit_ldxi_uc(rt_reg, JIT_REGISTER_STATE, V + 2 * hi + 1);
+					jit_ldxi_uc(tmp, JIT_REGISTER_STATE, V + 2 * lo);
+					jit_lshi(tmp, tmp, 8);
+					jit_orr(rt_reg, rt_reg, tmp);
+					jit_extr_s(rt_reg, rt_reg);
+					regs.unlock_mips_register(rt);
+					regs.unlock_mips_register(RegisterCache::SCRATCH_REGISTER0);
+				}
+				break;
+			}
+#endif
 			regs.flush_caller_save_registers(_jit);
 			regs.flush_mips_register(_jit, rt);
 			jit_begin_call(_jit);
@@ -1515,6 +2235,30 @@ void CPU::jit_instruction(jit_state_t *_jit, uint32_t pc, uint32_t instr,
 
 		case 004: // MTC2
 		{
+#ifdef PRSP_VU_FAST
+			if (vu_fast_enabled)
+			{
+				// sr[rt] -> vd lane (or the two lanes an odd element straddles); no helper call.
+				const unsigned V = offsetof(CPUState, cp2) + offsetof(CP2, regs) + rd * 16;
+				unsigned rt_reg = regs.load_mips_register_noext(_jit, rt);
+				if ((imm & 1) == 0)
+					jit_stxi_s(V + imm, JIT_REGISTER_STATE, rt_reg);
+				else
+				{
+					const unsigned i = imm >> 1;
+					unsigned tmp = regs.modify_mips_register(_jit, RegisterCache::SCRATCH_REGISTER0);
+					jit_rshi_u(tmp, rt_reg, 8);
+					jit_stxi_c(V + 2 * i, JIT_REGISTER_STATE, tmp);
+					regs.unlock_mips_register(RegisterCache::SCRATCH_REGISTER0);
+					if (imm != 0xf)
+						jit_stxi_c(V + 2 * (i + 1) + 1, JIT_REGISTER_STATE, rt_reg);
+				}
+				regs.unlock_mips_register(rt);
+				if (int(rd) == v0_holds)
+					v0_holds = -1;
+				break;
+			}
+#endif
 			regs.flush_caller_save_registers(_jit);
 			regs.flush_mips_register(_jit, rt);
 			jit_begin_call(_jit);
@@ -1795,6 +2539,9 @@ void CPU::jit_handle_latent_delay_slot(jit_state_t *_jit, const InstructionInfo 
 Func CPU::jit_region(uint64_t hash, unsigned pc_word, unsigned instruction_count)
 {
 	regs.reset();
+#ifdef PRSP_VU_FAST
+	v0_holds = -1;
+#endif
 
 	mips_disasm.clear();
 	jit_state_t *_jit = jit_new_state();
@@ -1823,6 +2570,9 @@ Func CPU::jit_region(uint64_t hash, unsigned pc_word, unsigned instruction_count
 			// Before we enter into a new block, we have to flush register window since someone can branch here.
 			regs.flush_register_window(_jit);
 			regs.reset();
+#ifdef PRSP_VU_FAST
+			v0_holds = -1;
+#endif
 			branch_targets[i] = jit_label();
 		}
 
@@ -1890,9 +2640,14 @@ Func CPU::jit_region(uint64_t hash, unsigned pc_word, unsigned instruction_count
 		jit_handle_latent_delay_slot(_jit, first_info);
 	}
 
+#ifdef PRSP_VU_FAST
+	jit_emit_slow_paths(_jit);
+#endif
+
 	for (auto &b : local_branches)
 		jit_patch_at(b.node, branch_targets[b.local_index]);
 
+	jit_node_t *end_label = jit_indirect();
 	jit_realize();
 	jit_word_t code_size;
 	jit_get_code(&code_size);
@@ -1902,6 +2657,16 @@ Func CPU::jit_region(uint64_t hash, unsigned pc_word, unsigned instruction_count
 	jit_set_code(block_code, code_size);
 
 	auto ret = reinterpret_cast<Func>(jit_emit());
+
+	// The size estimate is generous: return the unused tail so regions pack tightly.
+	{
+		size_t used = size_t(static_cast<uint8_t *>(jit_address(end_label)) - static_cast<uint8_t *>(block_code));
+		if (used == 0 || used > size_t(code_size))
+			used = size_t(code_size);
+		allocator.shrink_last(block_code, used);
+		code_size = jit_word_t(used);
+	}
+	dump_code(block_code, code_size);
 
 #ifdef TRACE_DISASM
 	printf(" === DISASM ===\n");
@@ -2247,6 +3012,41 @@ void RegisterCache::flush_caller_save_registers(jit_state_t *_jit)
 			assert(!entry.num_locks);
 			entry = {};
 		}
+	}
+}
+
+unsigned RegisterCache::snapshot_caller_save(Saved *out) const
+{
+	unsigned n = 0;
+	for (unsigned i = 0; i < JIT_R_NUM; i++)
+	{
+		const auto &entry = entries[jit_register_to_index(JIT_R(i))];
+		if (entry.is_live && entry.mips_register <= COND_BRANCH_TAKEN)
+		{
+			assert(n < MaxSaved);
+			out[n++] = { unsigned(JIT_R(i)), entry.mips_register, entry.modified, entry.sign == ZExt };
+		}
+	}
+	return n;
+}
+
+void RegisterCache::emit_spill(jit_state_t *_jit, const Saved *saved, unsigned count)
+{
+	for (unsigned i = 0; i < count; i++)
+		if (saved[i].modified && saved[i].mips_reg != 0)
+			jit_stxi_i(offsetof(CPUState, sr) + 4 * saved[i].mips_reg, JIT_REGISTER_STATE, saved[i].jit_reg);
+}
+
+void RegisterCache::emit_reload(jit_state_t *_jit, const Saved *saved, unsigned count)
+{
+	for (unsigned i = 0; i < count; i++)
+	{
+		if (saved[i].mips_reg == 0)
+			jit_movi(saved[i].jit_reg, 0);
+		else if (saved[i].zext)
+			jit_ldxi_ui(saved[i].jit_reg, JIT_REGISTER_STATE, offsetof(CPUState, sr) + 4 * saved[i].mips_reg);
+		else
+			jit_ldxi_i(saved[i].jit_reg, JIT_REGISTER_STATE, offsetof(CPUState, sr) + 4 * saved[i].mips_reg);
 	}
 }
 

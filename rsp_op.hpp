@@ -46,6 +46,21 @@ extern "C"
 	DECL_LS(SWV);
 	DECL_LS(STV);
 
+	// *_A: effective address computed by the caller (JIT slow paths).
+#define DECL_LS_A(op) void RSP_##op##_A(RSP::CPUState *rsp, unsigned rt, unsigned element, unsigned addr)
+	DECL_LS_A(LSV);
+	DECL_LS_A(SSV);
+	DECL_LS_A(LLV);
+	DECL_LS_A(SLV);
+	DECL_LS_A(LDV);
+	DECL_LS_A(SDV);
+	DECL_LS_A(LPV);
+	DECL_LS_A(SPV);
+	DECL_LS_A(LUV);
+	DECL_LS_A(SUV);
+	DECL_LS_A(LQV);
+	DECL_LS_A(SQV);
+
 #define DECL_COP2(op) void RSP_##op(RSP::CPUState *rsp, unsigned vd, unsigned vs, unsigned vt, unsigned e)
 	DECL_COP2(VMULF);
 	DECL_COP2(VMULU);

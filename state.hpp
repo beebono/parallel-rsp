@@ -130,6 +130,9 @@ struct CPUState
 
 	CP2 cp2 = {};
 	CP0 cp0;
+
+	// Constant 0..15 byte vector for the JIT's byte-shuffle code (kept in the state so it is reachable from x19).
+	alignas(16) uint8_t iota[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
 };
 
 enum ReturnMode

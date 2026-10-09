@@ -191,6 +191,8 @@ typedef enum {
     jit_code_live,		jit_code_align,
     jit_code_save,		jit_code_load,
 #define jit_skip(u)             jit_new_node_w(jit_code_skip, u)
+/* parallel-rsp extension (aarch64 only): emit a raw instruction word. */
+#define jit_raw(w)		jit_new_node_ww(jit_code_skip, 4, (jit_word_t)(jit_uint32_t)(w))
     jit_code_skip,
 #define jit_name(u)		_jit_name(_jit,u)
     jit_code_name,

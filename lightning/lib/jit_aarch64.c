@@ -1395,7 +1395,14 @@ _emit_code(jit_state_t *_jit)
 		    nop(node->u.w - word);
 		break;
 	    case jit_code_skip:
-		nop((node->u.w + 3) & ~3);
+		/* parallel-rsp extension: jit_skip with a non-zero second operand is a raw
+		 * 32-bit instruction word (u.w must be 4), see jit_raw() in lightning.h */
+		if (node->v.w) {
+		    assert(node->u.w == 4);
+		    ii((jit_uint32_t)node->v.w);
+		}
+		else
+		    nop((node->u.w + 3) & ~3);
 		break;
 	    case jit_code_note:		case jit_code_name:
 		node->u.w = _jit->pc.w;

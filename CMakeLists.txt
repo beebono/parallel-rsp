@@ -9,7 +9,7 @@ elseif (MSVC)
     set(PARALLEL_RSP_CXX_FLAGS /D_CRT_SECURE_NO_WARNINGS /wd4267 /wd4244 /wd4309 /wd4005 /MP /DNOMINMAX)
 endif()
 
-add_library(parallel-rsp STATIC
+set(PARALLEL_RSP_SOURCES
 		rsp/vfunctions.cpp
 		rsp_jit.cpp rsp_jit.hpp
 		jit_allocator.cpp jit_allocator.hpp
@@ -18,6 +18,7 @@ add_library(parallel-rsp STATIC
 		rsp/reciprocal.cpp rsp/reciprocal.h
 		rsp_1.1.h
 		rsp/cp0.cpp rsp/cp2.cpp
+		rsp/vu_inline.cpp rsp/vu_inline.h
 		arch/simd/rsp/rsp_core.cpp
 		arch/simd/rsp/clamp.h
 		arch/simd/rsp/rsp_common.h
@@ -47,6 +48,13 @@ add_library(parallel-rsp STATIC
 		arch/simd/rsp/vsubc.h
 		arch/simd/rsp/vxor.h
 		arch/simd/rsp/vmulm.h)
+# rsp/vu_inline.cpp holds the register-convention VU op bodies the aarch64 JIT copies into its code (x19 = CPUState). The copied
+# code must not touch any integer register the JIT keeps live, so every one of them is fixed for that file (x0-x8, x16, x17 stay free).
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+	set_source_files_properties(rsp/vu_inline.cpp PROPERTIES COMPILE_FLAGS
+		"-ffixed-x9 -ffixed-x10 -ffixed-x11 -ffixed-x12 -ffixed-x13 -ffixed-x14 -ffixed-x15 -ffixed-x18 -ffixed-x20 -ffixed-x21 -ffixed-x22 -ffixed-x23 -ffixed-x24 -ffixed-x25 -ffixed-x26 -ffixed-x27 -ffixed-x28")
+endif()
+add_library(parallel-rsp STATIC ${PARALLEL_RSP_SOURCES})
 
 option(PARALLEL_RSP_DEBUG_JIT "Enable the debug JIT." ON)
 
@@ -99,6 +107,15 @@ if (PARALLEL_RSP_DEBUG_JIT AND NOT WIN32)
 endif()
 
 option(PARALLEL_RSP_TESTS "Enable unit tests for Lightning CPU." ON)
+
+# Differential test: optimized JIT code generation vs the reference helper-call code generation (tests/jit_diff.cpp).
+option(PARALLEL_RSP_JIT_DIFF "Build the JIT differential test." OFF)
+if (PARALLEL_RSP_JIT_DIFF)
+	add_executable(rsp-jit-diff tests/jit_diff.cpp)
+	target_link_libraries(rsp-jit-diff PRIVATE parallel-rsp)
+	target_compile_definitions(parallel-rsp PUBLIC PRSP_LS_COUNT)
+	target_compile_options(rsp-jit-diff PRIVATE ${PARALLEL_RSP_CXX_FLAGS})
+endif()
 
 add_executable(rsp-vu-fuzzer rsp_vu_fuzzer.cpp)
 target_link_libraries(rsp-vu-fuzzer PRIVATE parallel-rsp)
@@ -199,4 +216,46 @@ if (PARALLEL_RSP_TESTS)
 	rsp_add_test(cop2-ls)
 	rsp_add_test(cop2-vector)
 	rsp_add_test(bug-shl-into-branch)
+endif()
+
+# Mupen64Plus RSP plugin (mupen64plus-rsp-parallel.so), usable standalone as the RSP plugin or as the
+# RspFallback of mupen64plus-rsp-hle. This needs PARALLEL_INTEGRATION (real SP DMA / RDP list handling in
+# cp0.cpp instead of the rsp-runner test harness behaviour) and the release JIT (no DEBUG_JIT), so it
+# gets its own copy of the library rather than sharing the target used by rsp-runner / the fuzzer.
+#
+#   cmake .. -DPARALLEL_RSP_M64P_PLUGIN=ON -DPARALLEL_RSP_DEBUG_JIT=OFF -DPARALLEL_RSP_TESTS=OFF \
+#            -DM64P_API_INCLUDE_DIR=<mupen64plus-core>/src/api -DCMAKE_BUILD_TYPE=Release
+option(PARALLEL_RSP_M64P_PLUGIN "Build the Mupen64Plus RSP plugin." OFF)
+set(M64P_API_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../mupen64plus-core/src/api" CACHE PATH
+    "Directory with m64p_types.h / m64p_plugin.h")
+
+if (PARALLEL_RSP_M64P_PLUGIN AND NOT WIN32)
+	add_library(lightning-m64p STATIC
+			lightning/lib/jit_disasm.c
+			lightning/lib/jit_memory.c
+			lightning/lib/jit_names.c
+			lightning/lib/jit_note.c
+			lightning/lib/jit_print.c
+			lightning/lib/jit_size.c
+			lightning/lib/lightning.c)
+	target_include_directories(lightning-m64p PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/lightning/include)
+	target_compile_definitions(lightning-m64p PUBLIC HAVE_MMAP=1)
+	set_target_properties(lightning-m64p PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+
+	add_library(mupen64plus-rsp-parallel MODULE ${PARALLEL_RSP_SOURCES} parallel.cpp m64p_plugin_entry.cpp)
+	set_target_properties(mupen64plus-rsp-parallel PROPERTIES
+			PREFIX ""
+			POSITION_INDEPENDENT_CODE ON
+			CXX_VISIBILITY_PRESET hidden
+			VISIBILITY_INLINES_HIDDEN ON)
+	target_include_directories(mupen64plus-rsp-parallel PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR}
+			${CMAKE_CURRENT_SOURCE_DIR}/arch/simd/rsp
+			${M64P_API_INCLUDE_DIR})
+	target_compile_definitions(mupen64plus-rsp-parallel PRIVATE
+			PARALLEL_INTEGRATION M64P_PLUGIN_API PARALLEL_RSP_LIGHTNING)
+	target_compile_options(mupen64plus-rsp-parallel PRIVATE ${PARALLEL_RSP_CXX_FLAGS})
+	target_link_libraries(mupen64plus-rsp-parallel PRIVATE lightning-m64p dl)
+	# Keep every non-API symbol (Lightning's _emit_*, etc.) private to the module.
+	target_link_options(mupen64plus-rsp-parallel PRIVATE -Wl,-Bsymbolic -Wl,--exclude-libs,ALL)
 endif()
