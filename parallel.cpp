@@ -78,12 +78,21 @@ extern "C"
 
 		*RSP::rsp.SP_PC_REG = 0x04001000 | (RSP::cpu.get_state().pc & 0xffc);
 
+		// RSP_MFC0 forces HALT when the ucode polls SP_STATUS for too long (it is waiting for the CPU). That is not
+		// the same as the ucode halting itself without BREAK (below): after a polling time-out the HALT bit has to be
+		// cleared again so that the core re-enters the RSP once the CPU has run (the CXD4 WAIT_FOR_CPU_HOST path),
+		// otherwise a task that waits on the CPU (Gauntlet Legends: graphics ucode idles at 0xfc8) is never resumed.
+		bool polling_timed_out = false;
+		for (auto count : RSP::MFC0_count)
+			if (count >= RSP::SP_STATUS_TIMEOUT)
+				polling_timed_out = true;
+
 		// From CXD4.
 		if (*RSP::rsp.SP_STATUS_REG & SP_STATUS_BROKE)
 			return cycles;
 		else if (*RSP::cpu.get_state().cp0.irq & 1)
 			RSP::rsp.CheckInterrupts();
-		else if (*RSP::rsp.SP_STATUS_REG & SP_STATUS_HALT)
+		else if ((*RSP::rsp.SP_STATUS_REG & SP_STATUS_HALT) && !polling_timed_out)
 			return cycles;
 		else if (*RSP::rsp.SP_SEMAPHORE_REG != 0) // Semaphore lock fixes.
 		{
