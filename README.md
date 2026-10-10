@@ -77,7 +77,7 @@ RspFallback = "/path/to/mupen64plus-rsp-parallel.so"
 
 `DisplayListToGraphicsPlugin = False` makes graphics tasks go to the fallback, which feeds the RDP plugin. Pair either setup with an LLE RDP
 plugin (foir, angrylion-rdp-plus); the `Core[RandomizeInterrupt]` setting is only relevant for bit-exact comparisons (set it to `False`).
-`mupen64plus-rdp-foir/README.md` ("RSP pairing") has the measured pairings and a full command line.
+The foir plugin's README (section "RSP pairing") has the measured pairings and a full command line.
 
 ## Building
 
@@ -91,9 +91,7 @@ PRSP_SHADOW=1  ./build_m64p_plugin.sh aarch64   # shadow-verification variant (b
 PRSP_PROFILE=1 ./build_m64p_plugin.sh aarch64   # profiling variant (build-m64p-aarch64-prof/)
 ```
 
-Release builds use `-O3` with generic armv8-a; `-mcpu` / `-march` made no measurable difference. The stock Ubuntu cross toolchain links
-glibc 2.38 symbols; for devices with an older glibc (e.g. 2.31) the workspace's `toolchains/rg35xxsp/build.sh prsp` builds
-with host g++-12 and a dynamically linked libstdc++ instead.
+Release builds use `-O3` with generic armv8-a; `-mcpu` / `-march` made no measurable difference.
 
 Tests (run the aarch64 ones under `qemu-aarch64-static -L /usr/aarch64-linux-gnu` on an x86_64 host, or directly on a device):
 

@@ -173,7 +173,7 @@ All run against the code being replaced, with 0 differences unless a mutation is
     after 6 tasks in DK64 (1 of 6 tasks differing); a variant that only forgot to dirty such blocks was not triggered in 40 s of DK64 / SM64
     (no compiled region overlapped the changed words), and the block-9 variant did not trigger in DK64 either; a table index off by one in the
     inline divide is reported as 277 differing RDP lists in the first 4 tasks of SM64. Reverted afterwards.
-- **End to end on the device** (tools in the foir repo): `mupen64plus-rdp-foir/tools/prsp/prsp_cmp.sh` (screenshots at VI frames
+- **End to end on the device** (scripts kept with the foir RDP plugin, `tools/prsp/prsp_cmp.sh` there; screenshots at VI frames
   300/900/1500/2100/2700 and a hash of DMEM+IMEM after every `DoRspCycles` call, new vs old `.so`, `Core[RandomizeInterrupt]=False`) and
   `prsp_cmp_audio.sh` (LLE audio stream of the standalone plugin).
 
