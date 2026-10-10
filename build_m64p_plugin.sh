@@ -14,6 +14,8 @@ if [ "$1" = "aarch64" ]; then
 fi
 # PRSP_PROFILE=1 builds the dynamic instruction-mix profiling variant into a separate build dir.
 if [ -n "$PRSP_PROFILE" ]; then DIR=$DIR-prof; ARGS+=(-DCMAKE_CXX_FLAGS=-DPRSP_PROFILE); fi
+# PRSP_SHADOW=1 builds the shadow-verification variant (see shadow.hpp): every task is replayed on a second JIT with the previous code paths.
+if [ -n "$PRSP_SHADOW" ]; then DIR=$DIR-shadow; ARGS+=(-DCMAKE_CXX_FLAGS=-DPRSP_SHADOW); fi
 [ -n "$M64P_API_INCLUDE_DIR" ] && ARGS+=(-DM64P_API_INCLUDE_DIR="$M64P_API_INCLUDE_DIR")
 mkdir -p "$DIR"
 cd "$DIR"

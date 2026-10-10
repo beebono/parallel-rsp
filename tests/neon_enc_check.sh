@@ -40,6 +40,25 @@ int main(){
   printf("add v2.16b,v2.16b,v3.16b\n%08x\n", add_16b(2,2,3)); printf("tbl v1.16b,{v1.16b},v2.16b\n%08x\n", tbl_16b(1,1,2));
   printf("cmhi v5.16b,v5.16b,v2.16b\n%08x\n", cmhi_16b(5,5,2)); printf("bsl v5.16b,v1.16b,v4.16b\n%08x\n", bsl_16b(5,1,4));
   printf("movi v5.16b,#16\n%08x\n", movi_16b(5,16)); printf("movi v5.16b,#255\n%08x\n", movi_16b(5,255)); printf("movi v6.16b,#33\n%08x\n", movi_16b(6,33));
+  printf("orr w1,w16,w1,lsl #16\n%08x\n", orr_w_lsl(1,16,1,16)); printf("eor w2,w0,w1\n%08x\n", eor_w(2,0,1)); printf("sub w3,w2,w1\n%08x\n", sub_w(3,2,1));
+  printf("sxth w0,w16\n%08x\n", sxth_w(0,16)); printf("clz w3,w2\n%08x\n", clz_w(3,2));
+  printf("lsl w4,w2,w3\n%08x\n", lslv_w(4,2,3)); printf("lsr w5,w5,w6\n%08x\n", lsrv_w(5,5,6));
+  printf("asr w1,w0,#31\n%08x\n", asr_w_imm(1,0,31)); printf("asr w6,w5,#16\n%08x\n", asr_w_imm(6,5,16));
+  printf("lsr w6,w6,#1\n%08x\n", lsr_w_imm(6,6,1)); printf("lsl w5,w5,#14\n%08x\n", lsl_w_imm(5,5,14));
+  printf("ubfx w4,w4,#22,#9\n%08x\n", ubfx_w(4,4,22,9)); printf("bfi w4,w3,#0,#1\n%08x\n", bfi0_w(4,3,1));
+  printf("csel w0,w1,w0,ne\n%08x\n", csel_w(0,1,0,1)); printf("csel w2,w3,w2,gt\n%08x\n", csel_w(2,3,2,12)); printf("csel w5,w6,w5,eq\n%08x\n", csel_w(5,6,5,0));
+  printf("cmn w0,#8,lsl #12\n%08x\n", cmn_w_lsl12(0,8)); printf("cmp w2,#0\n%08x\n", cmp_w_0(2));
+  printf("tst w17,#1\n%08x\n", ands_w_bm(31,17,0,0)); printf("orr w4,w4,#0x200\n%08x\n", orr_w_bm(4,4,23,0));
+  printf("orr w5,w5,#0x10000\n%08x\n", orr_w_bm(5,5,16,0)); printf("eor w6,w3,#31\n%08x\n", eor_w_bm(6,3,0,4));
+  printf("orr w6,wzr,#0x7fffffff\n%08x\n", orr_w_bm(6,31,0,30)); printf("orr w7,wzr,#0xffff0000\n%08x\n", orr_w_bm(7,31,16,15));
+  printf("and w7,w3,#1\n%08x\n", and_w_bm(7,3,0,0));
+  printf("ldr x5,[x19,#176]\n%08x\n", ldr_x(5,19,176)); printf("ldrh w5,[x5,w4,uxtw #1]\n%08x\n", ldrh_uxtw1(5,5,4));
+  printf("sqxtn v2.8b,v0.8h\n%08x\n", sqxtn_8b(2,0)); printf("sqxtn2 v2.16b,v1.8h\n%08x\n", sqxtn2_16b(2,1));
+  printf("add w16,w16,#1\n%08x\n", add_w_imm(16,16,1)); printf("add w3,w5,#4095\n%08x\n", add_w_imm(3,5,4095));
+  printf("sshr v4.16b,v4.16b,#7\n%08x\n", sshr_16b_7(4,4)); printf("sshr v1.16b,v30.16b,#7\n%08x\n", sshr_16b_7(1,30));
+  printf("and v2.16b,v2.16b,v3.16b\n%08x\n", and_16b(2,2,3)); printf("zip1 v2.16b,v2.16b,v4.16b\n%08x\n", zip1_16b(2,2,4));
+  printf("addv h5,v2.8h\n%08x\n", addv_h(5,2)); printf("smov w9,v5.h[0]\n%08x\n", smov_w_h0(9,5)); printf("smov w28,v5.h[0]\n%08x\n", smov_w_h0(28,5));
+  printf("strb wzr,[x19,#195]\n%08x\n", strb(31,19,195));
   for (unsigned i = 0; i < 16; i += 2) printf("ext v1.16b,v0.16b,v0.16b,#%u\n%08x\n", i, ext_16b(1,0,0,i));
 
 }

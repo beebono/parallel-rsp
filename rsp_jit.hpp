@@ -136,7 +136,19 @@ public:
 	{
 		vu_fast_enabled = enable;
 	}
+
+	// Test hook: the inlined VRCP / VRCPL / VRSQ / VRSQL / CFC2 (default on; only used while the register-convention path is on).
+	void set_div_inline(bool enable)
+	{
+		div_inline_enabled = enable;
+	}
 #endif
+
+	// Test hook: the IMEM DMA invalidation filter (see CPUState).
+	void set_imem_skip(bool enable)
+	{
+		state.imem_skip_identical = enable ? 1 : 0;
+	}
 
 	CPUState &get_state()
 	{
@@ -154,6 +166,23 @@ private:
 	Func blocks[IMEM_WORDS] = {};
 
 	void invalidate_code();
+
+#ifdef PRSP_SHADOW
+public:
+	// Shadow-verification build: every compiled region remembers the IMEM range and hash it was compiled from. A region that is
+	// still reachable through blocks[] must still match IMEM (checked after invalidate_code() in run()), and a region that no
+	// longer matches IMEM after an SP DMA must be covered by a dirty bit (shadow_check_blocks(first, last)).
+	struct BlockRec
+	{
+		unsigned pc_word, count;
+		uint64_t hash;
+	};
+	std::unordered_map<const void *, BlockRec> sh_block_rec;
+	uint64_t sh_checks = 0, sh_stale_after_invalidate = 0, sh_stale_not_dirty = 0;
+	void shadow_check_blocks(bool after_invalidate, unsigned first_word, unsigned last_word);
+
+private:
+#endif
 
 	uint64_t hash_imem(unsigned pc, unsigned count) const;
 
@@ -238,10 +267,12 @@ private:
 	};
 	VUStub vu_stubs[RSP_VU_STUB_COUNT];
 	bool vu_fast_enabled = true;
+	bool div_inline_enabled = true;
 	unsigned vu_inline_words = 8; // VU bodies up to this many words are copied inline instead of called
 	int v0_holds = -1; // vector register whose value v0 currently holds (-1 = unknown)
 	void init_vu_stubs();
 	bool jit_emit_vu_fast(jit_state_t *_jit, uint32_t instr);
+	void jit_emit_vu_divide(jit_state_t *_jit, uint32_t instr);
 
 	// Vector load / store fast paths with out-of-line slow paths (see jit_emit_ls_fast).
 	struct SlowLS

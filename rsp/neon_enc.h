@@ -68,6 +68,47 @@ static inline uint32_t tbl_16b(unsigned d, unsigned n, unsigned m) { return 0x4e
 static inline uint32_t cmhi_16b(unsigned d, unsigned n, unsigned m) { return 0x6e203400u | (m << 16) | (n << 5) | d; }
 static inline uint32_t bsl_16b(unsigned d, unsigned n, unsigned m) { return 0x6e601c00u | (m << 16) | (n << 5) | d; }
 static inline uint32_t movi_16b(unsigned d, unsigned imm8) { return 0x4f00e400u | ((imm8 >> 5) << 16) | ((imm8 & 31) << 5) | d; }
+
+// Scalar (W register) helpers used by the inlined VRCP / VRSQ sequences.
+// orr wD, wN, wM, lsl #sh ; eor / sub wD, wN, wM
+static inline uint32_t orr_w_lsl(unsigned d, unsigned n, unsigned m, unsigned sh) { return 0x2a000000u | (m << 16) | (sh << 10) | (n << 5) | d; }
+static inline uint32_t eor_w(unsigned d, unsigned n, unsigned m) { return 0x4a000000u | (m << 16) | (n << 5) | d; }
+static inline uint32_t sub_w(unsigned d, unsigned n, unsigned m) { return 0x4b000000u | (m << 16) | (n << 5) | d; }
+// sxth wD, wN ; clz wD, wN ; lsl / lsr wD, wN, wM
+static inline uint32_t sxth_w(unsigned d, unsigned n) { return 0x13003c00u | (n << 5) | d; }
+static inline uint32_t clz_w(unsigned d, unsigned n) { return 0x5ac01000u | (n << 5) | d; }
+static inline uint32_t lslv_w(unsigned d, unsigned n, unsigned m) { return 0x1ac02000u | (m << 16) | (n << 5) | d; }
+static inline uint32_t lsrv_w(unsigned d, unsigned n, unsigned m) { return 0x1ac02400u | (m << 16) | (n << 5) | d; }
+// asr / lsr / lsl wD, wN, #sh (1 <= sh <= 31)
+static inline uint32_t asr_w_imm(unsigned d, unsigned n, unsigned sh) { return 0x13007c00u | (sh << 16) | (n << 5) | d; }
+static inline uint32_t lsr_w_imm(unsigned d, unsigned n, unsigned sh) { return 0x53007c00u | (sh << 16) | (n << 5) | d; }
+static inline uint32_t lsl_w_imm(unsigned d, unsigned n, unsigned sh) { return 0x53000000u | (((32u - sh) & 31u) << 16) | ((31u - sh) << 10) | (n << 5) | d; }
+// ubfx wD, wN, #lsb, #width ; bfi wD, wN, #0, #width
+static inline uint32_t ubfx_w(unsigned d, unsigned n, unsigned lsb, unsigned width) { return 0x53000000u | (lsb << 16) | ((lsb + width - 1) << 10) | (n << 5) | d; }
+static inline uint32_t bfi0_w(unsigned d, unsigned n, unsigned width) { return 0x33000000u | ((width - 1) << 10) | (n << 5) | d; }
+// csel wD, wN, wM, cond (0 = eq, 1 = ne, 12 = gt)
+static inline uint32_t csel_w(unsigned d, unsigned n, unsigned m, unsigned cond) { return 0x1a800000u | (m << 16) | (cond << 12) | (n << 5) | d; }
+// cmn wN, #imm12, lsl #12 ; cmp wN, #0
+static inline uint32_t cmn_w_lsl12(unsigned n, unsigned imm) { return 0x31400000u | (imm << 10) | (n << 5) | 31u; }
+static inline uint32_t cmp_w_0(unsigned n) { return 0x7100001fu | (n << 5); }
+// and / orr / eor / ands wD, wN, #imm given as the (immr, imms) bitmask encoding with N = 0
+static inline uint32_t and_w_bm(unsigned d, unsigned n, unsigned immr, unsigned imms) { return 0x12000000u | (immr << 16) | (imms << 10) | (n << 5) | d; }
+static inline uint32_t orr_w_bm(unsigned d, unsigned n, unsigned immr, unsigned imms) { return 0x32000000u | (immr << 16) | (imms << 10) | (n << 5) | d; }
+static inline uint32_t eor_w_bm(unsigned d, unsigned n, unsigned immr, unsigned imms) { return 0x52000000u | (immr << 16) | (imms << 10) | (n << 5) | d; }
+static inline uint32_t ands_w_bm(unsigned d, unsigned n, unsigned immr, unsigned imms) { return 0x72000000u | (immr << 16) | (imms << 10) | (n << 5) | d; }
+// ldr xT, [xN, #off] (offset multiple of 8) ; ldrh wT, [xN, wM, uxtw #1]
+static inline uint32_t ldr_x(unsigned t, unsigned n, unsigned off) { return 0xf9400000u | ((off >> 3) << 10) | (n << 5) | t; }
+static inline uint32_t ldrh_uxtw1(unsigned t, unsigned n, unsigned m) { return 0x78605800u | (m << 16) | (n << 5) | t; }
+// add wD, wN, #imm12
+static inline uint32_t add_w_imm(unsigned d, unsigned n, unsigned imm) { return 0x11000000u | (imm << 10) | (n << 5) | d; }
+// NEON: sqxtn vD.8b, vN.8h ; sqxtn2 vD.16b, vN.8h ; sshr vD.16b, vN.16b, #7 ; and / zip1 vD.16b ; addv hD, vN.8h ; smov wD, vN.h[0]
+static inline uint32_t sqxtn_8b(unsigned d, unsigned n) { return 0x0e214800u | (n << 5) | d; }
+static inline uint32_t sqxtn2_16b(unsigned d, unsigned n) { return 0x4e214800u | (n << 5) | d; }
+static inline uint32_t sshr_16b_7(unsigned d, unsigned n) { return 0x4f090400u | (n << 5) | d; }
+static inline uint32_t and_16b(unsigned d, unsigned n, unsigned m) { return 0x4e201c00u | (m << 16) | (n << 5) | d; }
+static inline uint32_t zip1_16b(unsigned d, unsigned n, unsigned m) { return 0x4e003800u | (m << 16) | (n << 5) | d; }
+static inline uint32_t addv_h(unsigned d, unsigned n) { return 0x4e71b800u | (n << 5) | d; }
+static inline uint32_t smov_w_h0(unsigned d, unsigned n) { return 0x0e022c00u | (n << 5) | d; }
 }
 }
 #endif

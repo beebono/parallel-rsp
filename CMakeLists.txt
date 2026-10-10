@@ -18,6 +18,7 @@ set(PARALLEL_RSP_SOURCES
 		rsp/reciprocal.cpp rsp/reciprocal.h
 		rsp_1.1.h
 		rsp/cp0.cpp rsp/cp2.cpp
+		shadow.cpp shadow.hpp
 		rsp/vu_inline.cpp rsp/vu_inline.h
 		arch/simd/rsp/rsp_core.cpp
 		arch/simd/rsp/clamp.h

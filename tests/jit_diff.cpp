@@ -3,7 +3,7 @@
 // and compares the complete architectural state (scalar registers, vector registers, accumulator, flags, divide state, DMEM,
 // PC and delay slot state) after every program.
 //
-//   jit_diff [programs] [seed] [mode]      mode: all (default) | single | random
+//   jit_diff [programs] [seed] [mode]      mode: all (default) | single | random | vu | div
 #include "rsp_jit.hpp"
 #include <new>
 #include <random>
@@ -242,6 +242,47 @@ static uint32_t rnd_cop0()
 
 static const uint32_t BREAK = 0x0000000d;
 
+// ---- reciprocal / reciprocal square root (VRCP, VRCPL, VRCPH, VRSQ, VRSQL, VRSQH) and CFC2 / CTC2 ----
+enum { VRCP = 060, VRCPL = 061, VRCPH = 062, VMOV = 063, VRSQ = 064, VRSQL = 065, VRSQH = 066 };
+
+static uint16_t edge16()
+{
+	static const uint16_t edge[] = { 0, 1, 2, 3, 0x7fff, 0x8000, 0x8001, 0xffff, 0xfffe, 0xfffd, 0x4000, 0xc000, 0x0100, 0xff00,
+		                             0x00ff, 0x7ffe, 0x2000, 0x5555, 0xaaaa, 0x8100, 0x0080, 0xff80, 0x0200, 0xfe00 };
+	return edge[rnd() % (sizeof(edge) / sizeof(edge[0]))];
+}
+
+// Random state whose vector lanes, divide input and flag lanes are biased towards the corner cases of the divide unit.
+static void randomize_state_edge(CPUState &st, uint32_t *dmem)
+{
+	randomize_state(st, dmem);
+	for (int r = 0; r < 32; r++)
+		for (int i = 0; i < 8; i++)
+			if (rnd() % 3)
+				st.cp2.regs[r].e[i] = edge16();
+	st.cp2.div_in = (rnd() % 4) ? edge16() : uint16_t(rnd());
+	st.cp2.div_out = rnd();
+	st.cp2.dp_flag = rnd() & 1;
+}
+
+static uint32_t cop2_move(unsigned rs, unsigned rt, unsigned rd)
+{
+	return (022u << 26) | (rs << 21) | (rt << 16) | (rd << 11);
+}
+
+static uint32_t rnd_div_op()
+{
+	static const unsigned ops[] = { VRCP, VRCPL, VRCPH, VRSQ, VRSQL, VRSQH, VRCPL, VRSQL };
+	unsigned vd = rnd() % 32, vs = rnd() % 32, vt = rnd() % 32;
+	switch (rnd() % 6)
+	{
+	case 0: vd = vt; break;
+	case 1: vs = (vs & ~7u) | (rnd() % 8); break;
+	default: break;
+	}
+	return vu_instr(ops[rnd() % 8], vd, vs, vt, rnd() % 16);
+}
+
 static void gen_program(uint32_t *imem, unsigned len, int mode)
 {
 	for (unsigned i = 0; i < 1024; i++)
@@ -349,6 +390,74 @@ int main(int argc, char **argv)
 			for (unsigned i = 0; i < 8; i++)
 				imem0[len + i] = BREAK;
 			run_one("vu");
+		}
+	}
+	if (mode == "all" || mode == "div")
+	{
+		// (a) Exhaustive sweep of the single-precision input: every 16-bit value in every lane, for all 8 lane selections of
+		//     VRCP / VRSQ (writing every destination element), followed by CFC2 of all three flag registers.
+		for (unsigned base = 0; base < 65536; base += 8)
+		{
+			randomize_state_edge(*init, dmem0);
+			memset(imem0, 0, sizeof(imem0));
+			for (unsigned i = 0; i < 8; i++)
+				init->cp2.regs[2].e[i] = uint16_t(base + i);
+			unsigned n = 0;
+			for (unsigned i = 0; i < 8; i++)
+			{
+				imem0[n++] = vu_instr(VRCP, 1, i, 2, 8 + i);
+				imem0[n++] = vu_instr(VRSQ, 3, i, 2, 8 + i);
+			}
+			imem0[n++] = vu_instr(VRCP, 4, 5, 2, 0); // e < 8: the element index is e & 7 as well
+			imem0[n++] = vu_instr(VRSQ, 6, 7, 2, 7);
+			for (unsigned f = 0; f < 4; f++)
+				imem0[n++] = cop2_move(2, 8 + f, f);
+			imem0[n++] = BREAK;
+			run_one("div-sweep");
+		}
+		// (b) Double precision: VRCPH / VRSQH loads div_in from a lane, VRCPL / VRSQL combines it with the next lane. High and low
+		//     halves from the corner-case set and fully random, mixed single / double / stale dp_flag sequences.
+		for (unsigned p = 0; p < programs * 8; p++)
+		{
+			randomize_state_edge(*init, dmem0);
+			memset(imem0, 0, sizeof(imem0));
+			unsigned n = 0, pairs = 1 + rnd() % 3;
+			for (unsigned k = 0; k < pairs; k++)
+			{
+				bool rsq = rnd() & 1;
+				unsigned vt = rnd() % 32, e = rnd() % 16;
+				if (rnd() % 2)
+					init->cp2.regs[vt].e[e & 7] = (rnd() % 3) ? edge16() : uint16_t(rnd());
+				if (rnd() % 4)
+					imem0[n++] = vu_instr(rsq ? VRSQH : VRCPH, rnd() % 32, rnd() % 32, vt, e);
+				unsigned vt2 = (rnd() % 3) ? vt : rnd() % 32, e2 = (rnd() % 3) ? e : rnd() % 16;
+				imem0[n++] = vu_instr(rsq ? VRSQL : VRCPL, rnd() % 32, rnd() % 32, vt2, e2);
+				if (rnd() % 3 == 0)
+					imem0[n++] = vu_instr(rsq ? VRSQL : VRCPL, rnd() % 32, rnd() % 32, rnd() % 32, rnd() % 16); // dp_flag already cleared
+			}
+			imem0[n++] = cop2_move(2, 1 + rnd() % 31, rnd() % 4);
+			imem0[n++] = BREAK;
+			run_one("div-pairs");
+		}
+		// (c) Random programs of divide ops mixed with other VU ops, CTC2 / CFC2 / MTC2 / MFC2 and scalar code.
+		for (unsigned p = 0; p < programs; p++)
+		{
+			randomize_state_edge(*init, dmem0);
+			memset(imem0, 0, sizeof(imem0));
+			unsigned len = 4 + rnd() % 40;
+			for (unsigned i = 0; i < len; i++)
+			{
+				unsigned k = rnd() % 100;
+				if (k < 40) imem0[i] = rnd_div_op();
+				else if (k < 55) imem0[i] = rnd_vu();
+				else if (k < 70) imem0[i] = cop2_move(2, rnd() % 32, rnd() % 32);                    // CFC2
+				else if (k < 80) imem0[i] = cop2_move(6, rnd() % 32, rnd() % 32);                    // CTC2
+				else if (k < 90) imem0[i] = rnd_cop2move();
+				else imem0[i] = rnd_scalar();
+			}
+			for (unsigned i = 0; i < 8; i++)
+				imem0[len + i] = BREAK;
+			run_one("div-random");
 		}
 	}
 	if (mode == "all" || mode == "random")

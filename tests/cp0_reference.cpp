@@ -142,11 +142,13 @@ extern "C"
 
 				if (dest_addr & 0x1000)
 				{
-					// Invalidate IMEM.
-					unsigned block = (dest_addr & 0xfff) / CODE_BLOCK_SIZE;
-					rsp->dirty_blocks |= (0x3 << block) >> 1;
-					//rsp->dirty_blocks = ~0u;
-					rsp->imem[(dest_addr & 0xfff) >> 2] = word;
+					// Invalidate IMEM: only a word that changes dirties its block (and the previous one).
+					if (rsp->imem[(dest_addr & 0xfff) >> 2] != word)
+					{
+						unsigned block = (dest_addr & 0xfff) / CODE_BLOCK_SIZE;
+						rsp->dirty_blocks |= (0x3 << block) >> 1;
+						rsp->imem[(dest_addr & 0xfff) >> 2] = word;
+					}
 				}
 				else
 					rsp->dmem[dest_addr >> 2] = word;

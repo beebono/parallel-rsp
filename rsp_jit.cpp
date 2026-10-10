@@ -101,10 +101,17 @@ CPU::CPU()
 {
 	init_jit("RSP");
 	init_jit_thunks();
+	const char *noskip = getenv("PRSP_NO_IMEM_SKIP"); // A/B switch: dirty IMEM blocks on every SP DMA, as before
+	if (noskip && *noskip && *noskip != '0')
+		state.imem_skip_identical = 0;
 #ifdef PRSP_VU_FAST
 	const char *slow = getenv("PRSP_NO_VU_FAST");
 	if (slow && *slow && *slow != '0')
 		vu_fast_enabled = false;
+	// A/B switch: PRSP_NO_DIV_INLINE=1 calls the VRCP / VRSQ / CFC2 helpers again.
+	const char *nodiv = getenv("PRSP_NO_DIV_INLINE");
+	if (nodiv && *nodiv && *nodiv != '0')
+		div_inline_enabled = false;
 	if (const char *iw = getenv("PRSP_INLINE_WORDS"))
 		vu_inline_words = unsigned(atoi(iw));
 	init_vu_stubs();
@@ -508,6 +515,11 @@ bool CPU::jit_emit_vu_fast(jit_state_t *_jit, uint32_t instr)
 	const unsigned vt = (instr >> 16) & 31;
 	const unsigned e = (instr >> 21) & 15;
 	const int id = map[op];
+	if (div_inline_enabled && (op == 060 || op == 061 || op == 064 || op == 065))
+	{
+		jit_emit_vu_divide(_jit, instr);
+		return true;
+	}
 	if (id == -1)
 		return false;
 	if (id == -2)
@@ -613,6 +625,107 @@ bool CPU::jit_emit_vu_fast(jit_state_t *_jit, uint32_t instr)
 	v0_holds = int(vd);
 #undef RAW
 	return true;
+}
+
+// VRCP / VRCPL / VRSQ / VRSQL without a helper call. Branch-free, bit-identical to rsp_vrcp_vrsq<>() in
+// arch/simd/rsp/vrcpsq.h (see the comments there for the algorithm), using only x0-x7, w16, w17 and v1:
+//   acc_lo = vt shuffled by e; input = (L variant && dp_flag) ? div_in:vt.e[e & 7] : sign_extend(vt.e[e & 7]); dp_flag = 0;
+//   data = |input| (one's complement for input <= -32768); shift = clz(data);
+//   result = ROM lookup, 0x7fffffff for data == 0, 0xffff0000 for input == -32768, otherwise negated when input < 0;
+//   div_out = result >> 16; vd.e[vs & 7] = result.
+void CPU::jit_emit_vu_divide(jit_state_t *_jit, uint32_t instr)
+{
+	using namespace NeonEnc;
+#define RAW(w) jit_raw(w)
+	const uint32_t op = instr & 63;
+	const unsigned vd = (instr >> 6) & 31;
+	const unsigned de = (instr >> 11) & 7;
+	const unsigned vt = (instr >> 16) & 31;
+	const unsigned e = (instr >> 21) & 15;
+	const bool rsq = op >= 064;
+	const bool low = (op & 1) != 0; // VRCPL / VRSQL consume the double-precision flag
+	const unsigned cp2 = offsetof(CPUState, cp2);
+	const unsigned reg_base = cp2 + offsetof(CP2, regs);
+	const unsigned acc_lo = cp2 + offsetof(CP2, acc) + 32;
+	const unsigned div_in = cp2 + offsetof(CP2, div_in);
+	const unsigned div_out = cp2 + offsetof(CP2, div_out);
+	const unsigned dp_flag = cp2 + offsetof(CP2, dp_flag);
+
+	// acc_lo = shuffled vt.
+	if (int(vt) == v0_holds)
+		RAW(mov16b(1, 0));
+	else
+		RAW(ldr_q(1, 19, reg_base + vt * 16));
+	if (e >= 8)
+		RAW(dup_8h(1, 1, e - 8));
+	else if (e >= 2)
+	{
+		if (e < 4)
+			RAW(e == 2 ? trn1_8h(1, 1, 1) : trn2_8h(1, 1, 1));
+		else
+		{
+			RAW((e & 1) == 0 ? trn1_8h(1, 1, 1) : trn2_8h(1, 1, 1));
+			RAW((e & 2) == 0 ? trn1_4s(1, 1, 1) : trn2_4s(1, 1, 1));
+		}
+	}
+	RAW(str_q(1, 19, acc_lo));
+
+	RAW(ldrh(16, 19, reg_base + vt * 16 + 2 * (e & 7))); // w16 = vt.e[e & 7]
+	if (low)
+	{
+		RAW(ldrb(17, 19, dp_flag));
+		RAW(ldrh(1, 19, div_in));
+		RAW(strb(31, 19, dp_flag));
+		RAW(orr_w_lsl(1, 16, 1, 16)); // w1 = div_in:vt (double-precision input)
+		RAW(sxth_w(0, 16));           // w0 = sign extended vt (single-precision input)
+		RAW(ands_w_bm(31, 17, 0, 0)); // tst w17, #1
+		RAW(csel_w(0, 1, 0, 1));      // w0 = input
+	}
+	else
+	{
+		RAW(strb(31, 19, dp_flag));
+		RAW(sxth_w(0, 16));
+	}
+	RAW(asr_w_imm(1, 0, 31));      // w1 = input_mask
+	RAW(eor_w(2, 0, 1));           // w2 = input ^ mask
+	RAW(sub_w(3, 2, 1));           // w3 = data + 1 for negative inputs
+	RAW(cmn_w_lsl12(0, 8));        // input vs -32768
+	RAW(csel_w(2, 3, 2, 12));      // w2 = data (input > -32768 ? w3 : w2)
+	RAW(clz_w(3, 2));              // w3 = shift (32 for data == 0, the result is replaced below)
+	RAW(lslv_w(4, 2, 3));
+	RAW(ubfx_w(4, 4, 22, 9));      // w4 = table index
+	if (rsq)
+	{
+		RAW(orr_w_bm(4, 4, 23, 0)); // idx | 0x200
+		RAW(bfi0_w(4, 3, 1));       // bit 0 = shift & 1
+	}
+	RAW(ldr_x(5, 19, offsetof(CPUState, recip_rom)));
+	RAW(ldrh_uxtw1(5, 5, 4));
+	RAW(orr_w_bm(5, 5, 16, 0));    // 0x10000 | rom
+	RAW(lsl_w_imm(5, 5, 14));
+	RAW(eor_w_bm(6, 3, 0, 4));     // 31 - shift
+	if (rsq)
+		RAW(lsr_w_imm(6, 6, 1));
+	RAW(lsrv_w(5, 5, 6));
+	RAW(eor_w(5, 5, 1));           // ^ input_mask
+	RAW(cmp_w_0(2));
+	RAW(orr_w_bm(6, 31, 0, 30));   // 0x7fffffff
+	RAW(csel_w(5, 6, 5, 0));       // data == 0
+	RAW(cmn_w_lsl12(0, 8));
+	RAW(orr_w_bm(7, 31, 16, 15));  // 0xffff0000
+	RAW(csel_w(5, 7, 5, 0));       // input == -32768
+	RAW(asr_w_imm(6, 5, 16));
+	RAW(strh(6, 19, div_out));
+	RAW(strh(5, 19, reg_base + vd * 16 + 2 * de));
+	if (int(vd) == v0_holds)
+		v0_holds = -1;
+#ifdef PRSP_SHADOW
+	// ldr w16, [x19, #sh_div_ops] ; add w16, w16, #1 ; str w16, [x19, #sh_div_ops]
+	RAW(ldr_w(16, 19, offsetof(CPUState, sh_div_ops)));
+	RAW(add_w_imm(16, 16, 1));
+	RAW(str_w(16, 19, offsetof(CPUState, sh_div_ops)));
+#endif
+#undef RAW
 }
 
 // Physical register number of a Lightning register, for raw instruction words.
@@ -1076,9 +1189,46 @@ Func CPU::get_jit_block(uint32_t pc)
 			block = ptr;
 		else
 			block = ptr = jit_region(hash, word_pc, end - word_pc);
+#ifdef PRSP_SHADOW
+		sh_block_rec[reinterpret_cast<const void *>(block)] = { word_pc, end - word_pc, hash };
+#endif
 	}
 	return block;
 }
+
+#ifdef PRSP_SHADOW
+void CPU::shadow_check_blocks(bool after_invalidate, unsigned first_word, unsigned last_word)
+{
+	for (unsigned w = 0; w < IMEM_WORDS; w++)
+	{
+		if (!blocks[w])
+			continue;
+		auto it = sh_block_rec.find(reinterpret_cast<const void *>(blocks[w]));
+		if (it == sh_block_rec.end() || it->second.pc_word != w)
+		{
+			fprintf(stderr, "prsp shadow: blocks[%u] has no record\n", w);
+			sh_stale_after_invalidate++;
+			continue;
+		}
+		const auto &r = it->second;
+		if (r.pc_word + r.count <= first_word || r.pc_word > last_word) // does not overlap the range of interest
+			continue;
+		sh_checks++;
+		if (hash_imem(r.pc_word, r.count) == r.hash)
+			continue;
+		if (after_invalidate)
+		{
+			sh_stale_after_invalidate++;
+			fprintf(stderr, "prsp shadow: stale region at word %u (+%u) survived invalidate_code()\n", w, r.count);
+		}
+		else if (!(state.dirty_blocks & (1u << (w >> 6))))
+		{
+			sh_stale_not_dirty++;
+			fprintf(stderr, "prsp shadow: region at word %u (+%u) no longer matches IMEM but its block is not dirty\n", w, r.count);
+		}
+	}
+}
+#endif
 
 int CPU::enter(uint32_t pc)
 {
@@ -1544,6 +1694,7 @@ void CPU::jit_instruction(jit_state_t *_jit, uint32_t pc, uint32_t instr,
 		{
 			unsigned sub = (instr >> 21) & 31;
 			keeps_v0 = sub == 000 || sub == 004; // MFC2 / MTC2 are inlined below (MTC2 invalidates v0 itself when needed)
+			keeps_v0 = keeps_v0 || (sub == 002 && div_inline_enabled); // CFC2 only uses v2-v5
 		}
 		else if (t == 020 && vu_fast_enabled)
 		{
@@ -2223,6 +2374,38 @@ void CPU::jit_instruction(jit_state_t *_jit, uint32_t pc, uint32_t instr,
 
 		case 002: // CFC2
 		{
+#ifdef PRSP_VU_FAST
+			if (vu_fast_enabled && div_inline_enabled)
+			{
+				// sr[rt] = sign extended movemask of the packed VCO / VCC / VCE lanes (same as rsp_get_flags()); no helper call.
+				if (rt == 0)
+					break;
+				using namespace NeonEnc;
+				unsigned src = rd & 3;
+				if (src == 3)
+					src = 2;
+				const unsigned fl = offsetof(CPUState, cp2) + offsetof(CP2, flags) + src * sizeof(CP2::flags[0]);
+				unsigned rt_reg = regs.modify_mips_register(_jit, rt);
+				jit_raw(ldr_q(0 + 2, 19, fl + 16)); // v2 = flags lo lanes
+				jit_raw(ldr_q(1 + 2, 19, fl));      // v3 = flags hi lanes
+				jit_raw(sqxtn_8b(4, 2));            // v4 = packs(lo, hi)
+				jit_raw(sqxtn2_16b(4, 3));
+				jit_raw(sshr_16b_7(4, 4));          // lane sign -> 0x00 / 0xff (the flag lanes are not always 0 / 0xffff)
+				jit_raw(ldr_q(2, 19, offsetof(CPUState, flag_weights)));
+				jit_raw(and_16b(4, 4, 2));
+				jit_raw(ext_16b(3, 4, 4, 8));
+				jit_raw(zip1_16b(4, 4, 3));
+				jit_raw(addv_h(5, 4));
+				jit_raw(smov_w_h0(phys_reg(rt_reg), 5));
+#ifdef PRSP_SHADOW
+				jit_raw(ldr_w(16, 19, offsetof(CPUState, sh_cfc2_ops)));
+				jit_raw(add_w_imm(16, 16, 1));
+				jit_raw(str_w(16, 19, offsetof(CPUState, sh_cfc2_ops)));
+#endif
+				regs.unlock_mips_register(rt);
+				break;
+			}
+#endif
 			regs.flush_caller_save_registers(_jit);
 			regs.flush_mips_register(_jit, rt);
 			jit_begin_call(_jit);
@@ -2685,6 +2868,9 @@ Func CPU::jit_region(uint64_t hash, unsigned pc_word, unsigned instruction_count
 ReturnMode CPU::run()
 {
 	invalidate_code();
+#ifdef PRSP_SHADOW
+	shadow_check_blocks(true, 0, IMEM_WORDS);
+#endif
 	for (;;)
 	{
 		int ret = enter(state.pc);
@@ -3088,3 +3274,13 @@ unsigned RegisterCache::entry_to_jit_register(const CacheEntry &entry)
 
 } // namespace JIT
 } // namespace RSP
+
+#ifdef PRSP_SHADOW
+// Called by the SP DMA read after it wrote IMEM bytes [off, off + bytes).
+extern "C" void prsp_shadow_after_imem_write(RSP::CPUState *state, unsigned off, unsigned bytes)
+{
+	// CPUState is the first member of CPU (static_assert in CPU::enter()).
+	auto *cpu = reinterpret_cast<RSP::JIT::CPU *>(state);
+	cpu->shadow_check_blocks(false, off >> 2, (off + bytes - 1) >> 2);
+}
+#endif

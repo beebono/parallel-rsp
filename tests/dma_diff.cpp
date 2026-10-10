@@ -48,7 +48,7 @@ int main(int argc, char **argv)
 	std::mt19937 rnd(argc > 2 ? atoi(argv[2]) : 1);
 	RSP::rsp.ProcessRdpList = fake_process_rdp_list;
 	M a, b;
-	unsigned bad = 0;
+	unsigned bad = 0, imem_reads = 0, imem_clean = 0, imem_partial = 0;
 	for (unsigned it = 0; it < iters; it++)
 	{
 		for (unsigned i = 0; i < 0x800000 / 4; i += 1 + rnd() % 4096)
@@ -80,8 +80,42 @@ int main(int argc, char **argv)
 			m->cr[RSP::CP0_REGISTER_DMA_DRAM] = dram;
 			m->st.sr[1] = lenreg;
 		}
+		// Make part of a read into IMEM write identical bytes (whole rows, single words, whole blocks), so that skipping the
+		// invalidation of unchanged blocks is exercised with partial overlaps; both machines get the same RDRAM.
+		if (!write && (cache & 0x1000) && rnd() % 4 != 0)
+		{
+			uint32_t l = ((len & 0xfff) + 1 + 7) & ~7u;
+			uint32_t c = cache & ~3u, d = dram & ~7u;
+			if ((c & 0xfff) + l > 0x1000)
+				l = 0x1000 - (c & 0xfff);
+			unsigned mode = rnd() % 4;
+			for (unsigned r = 0; r <= count; r++)
+			{
+				uint32_t s = d + r * (l + skip), t = c + r * l;
+				for (unsigned j = 0; j < l; j += 4)
+				{
+					uint32_t sa = (s + j) & 0x7FFFFC, da = (t + j) & 0x1FFC;
+					bool same = mode == 0 ? true : mode == 1 ? ((da >> 8) & 1) : mode == 2 ? (rnd() % 16 != 0) : (rnd() % 2);
+					if ((da & 0x1000) && same)
+						a.rdram[sa >> 2] = a.imem[(da & 0xfff) >> 2];
+				}
+			}
+			memcpy(b.rdram, a.rdram, 0x800000);
+		}
 		RSP_MTC0(&a.st, write ? RSP::CP0_REGISTER_DMA_WRITE_LENGTH : RSP::CP0_REGISTER_DMA_READ_LENGTH, 1);
 		RSP_MTC0_ref(&b.st, write ? RSP::CP0_REGISTER_DMA_WRITE_LENGTH : RSP::CP0_REGISTER_DMA_READ_LENGTH, 1);
+		if (!write && (cache & 0x1000))
+		{
+			imem_reads++;
+			unsigned changed = 0;
+			for (unsigned k = 0; k < 16; k++)
+				changed += memcmp(a.imem + k * 64, b.imem + k * 64, 256) != 0;
+			(void)changed;
+			if (!a.st.dirty_blocks)
+				imem_clean++;
+			else if (__builtin_popcount(a.st.dirty_blocks) < 15)
+				imem_partial++;
+		}
 		bool ok = !memcmp(a.rdram, b.rdram, 0x800000) && !memcmp(a.dmem, b.dmem, 4096) && !memcmp(a.imem, b.imem, 4096) &&
 		          !memcmp(a.cr, b.cr, sizeof(a.cr)) && a.st.dirty_blocks == b.st.dirty_blocks;
 		if (!ok)
@@ -92,6 +126,7 @@ int main(int argc, char **argv)
 				        a.st.dirty_blocks, b.st.dirty_blocks);
 		}
 	}
-	fprintf(stderr, "dma_diff: %u iterations, %u mismatches\n", iters, bad);
+	fprintf(stderr, "dma_diff: %u iterations (%u reads into IMEM: %u left every block clean, %u dirtied only some blocks), %u mismatches\n", iters,
+	        imem_reads, imem_clean, imem_partial, bad);
 	return bad != 0;
 }

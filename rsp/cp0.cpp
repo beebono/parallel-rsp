@@ -20,6 +20,10 @@ extern "C"
 #ifdef INTENSE_DEBUG
 	void log_rsp_mem_parallel(void);
 #endif
+#ifdef PRSP_SHADOW
+	void prsp_shadow_after_imem_write(RSP::CPUState *state, unsigned off, unsigned bytes);
+	void prsp_shadow_dma_write(const void *state, unsigned rdram_byte_addr, unsigned bytes);
+#endif
 
 	int RSP_MFC0(RSP::CPUState *rsp, unsigned rt, unsigned rd)
 	{
@@ -107,6 +111,39 @@ extern "C"
 	}
 
 #ifdef PARALLEL_INTEGRATION
+	// The only way the RSP itself can modify IMEM is an SP DMA read (stores address DMEM only). Copies `bytes` (a multiple
+	// of 4) from `src` to IMEM at byte offset `off` (off + bytes <= 0x1000) and marks the code blocks dirty. A block is
+	// marked (together with its predecessor, because a compiled region starting there can extend into it) only when the
+	// copy actually changes one of its bytes: microcode that is reloaded unchanged (the boot ucode copies the same text to
+	// IMEM for every task) then keeps its compiled blocks.
+	static inline void copy_to_imem(RSP::CPUState *rsp, unsigned off, const uint32_t *src, unsigned bytes)
+	{
+		if (!bytes)
+			return;
+		const unsigned end = off + bytes;
+		for (unsigned block = off / CODE_BLOCK_SIZE; block <= (end - 1) / CODE_BLOCK_SIZE; block++)
+		{
+			const unsigned b0 = block * CODE_BLOCK_SIZE > off ? block * CODE_BLOCK_SIZE : off;
+			const unsigned b1 = (block + 1) * CODE_BLOCK_SIZE < end ? (block + 1) * CODE_BLOCK_SIZE : end;
+			uint32_t *dst = rsp->imem + (b0 >> 2);
+			const uint32_t *from = src + ((b0 - off) >> 2);
+#ifdef PRSP_SHADOW
+			rsp->sh_imem_blocks++;
+#endif
+			if (rsp->imem_skip_identical && !memcmp(dst, from, b1 - b0))
+				continue;
+#ifdef PRSP_SHADOW
+			if (memcmp(dst, from, b1 - b0))
+				rsp->sh_imem_changed++;
+#endif
+			rsp->dirty_blocks |= (0x3 << block) >> 1;
+			memcpy(dst, from, b1 - b0);
+		}
+#ifdef PRSP_SHADOW
+		prsp_shadow_after_imem_write(rsp, off, bytes);
+#endif
+	}
+
 	static int rsp_dma_read(RSP::CPUState *rsp)
 	{
 		uint32_t length_reg = *rsp->cp0.cr[CP0_REGISTER_DMA_READ_LENGTH];
@@ -140,14 +177,7 @@ extern "C"
 			{
 				// The row neither wraps in RDRAM nor straddles DMEM / IMEM: plain copy.
 				if (dest_start & 0x1000)
-				{
-					// Invalidate IMEM.
-					const unsigned first = (dest_start & 0xfff) / CODE_BLOCK_SIZE;
-					const unsigned last = ((dest_start & 0xfff) + length - 1) / CODE_BLOCK_SIZE;
-					for (unsigned block = first; block <= last; block++)
-						rsp->dirty_blocks |= (0x3 << block) >> 1;
-					memcpy(rsp->imem + ((dest_start & 0xfff) >> 2), rsp->rdram + (source_start >> 2), length);
-				}
+					copy_to_imem(rsp, dest_start & 0xfff, rsp->rdram + (source_start >> 2), length);
 				else
 					memcpy(rsp->dmem + (dest_start >> 2), rsp->rdram + (source_start >> 2), length);
 			}
@@ -161,13 +191,7 @@ extern "C"
 					uint32_t word = rsp->rdram[source_addr >> 2];
 
 					if (dest_addr & 0x1000)
-					{
-						// Invalidate IMEM.
-						unsigned block = (dest_addr & 0xfff) / CODE_BLOCK_SIZE;
-						rsp->dirty_blocks |= (0x3 << block) >> 1;
-						//rsp->dirty_blocks = ~0u;
-						rsp->imem[(dest_addr & 0xfff) >> 2] = word;
-					}
+						copy_to_imem(rsp, dest_addr & 0xfff, &word, 4);
 					else
 						rsp->dmem[dest_addr >> 2] = word;
 
@@ -223,6 +247,9 @@ extern "C"
 				const uint32_t *src = (source_start & 0x1000) ? rsp->imem + ((source_start & 0xfff) >> 2)
 				                                              : rsp->dmem + (source_start >> 2);
 				memcpy(rsp->rdram + (dest_start >> 2), src, length);
+#ifdef PRSP_SHADOW
+				prsp_shadow_dma_write(rsp, dest_start, length);
+#endif
 			}
 			else
 			{
@@ -234,6 +261,9 @@ extern "C"
 
 					rsp->rdram[dest_addr >> 2] =
 					    (source_addr & 0x1000) ? rsp->imem[(source_addr & 0xfff) >> 2] : rsp->dmem[source_addr >> 2];
+#ifdef PRSP_SHADOW
+					prsp_shadow_dma_write(rsp, dest_addr, 4);
+#endif
 
 					j += 4;
 				} while (j < length);

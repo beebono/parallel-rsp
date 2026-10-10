@@ -2,6 +2,7 @@
 #define STATE_HPP__
 
 #include "rsp_common.h"
+#include "rsp/reciprocal.h"
 
 #define DMEM_SIZE (4 * 1024)
 #define IMEM_SIZE (4 * 1024)
@@ -122,17 +123,28 @@ struct CPUState
 
 	uint32_t has_delay_slot = 0;
 	uint32_t branch_target = 0;
+	uint32_t imem_skip_identical = 1; // SP DMA into IMEM only dirties the code blocks whose bytes change (0: always, the original behaviour)
 
 	uint32_t sr[33] = {}; // r32 is used as a scratch register.
 	uint32_t *dmem = nullptr;
 	uint32_t *imem = nullptr;
 	uint32_t *rdram = nullptr;
+	const uint16_t *recip_rom = rsp_reciprocal_rom; // reachable from x19 for the inlined VRCP / VRSQ table lookup
 
 	CP2 cp2 = {};
 	CP0 cp0;
 
 	// Constant 0..15 byte vector for the JIT's byte-shuffle code (kept in the state so it is reachable from x19).
 	alignas(16) uint8_t iota[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+	// Bit weights for the inlined CFC2 (movemask of the packed flag lanes).
+	alignas(16) uint8_t flag_weights[16] = { 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128 };
+#ifdef PRSP_SHADOW
+	// Statistics of the shadow-verification build (shadow.cpp), counted by the generated code / the DMA.
+	uint32_t sh_div_ops = 0; // executed VRCP / VRCPL / VRSQ / VRSQL
+	uint32_t sh_cfc2_ops = 0; // executed CFC2
+	uint32_t sh_imem_blocks = 0; // IMEM code blocks covered by SP DMA reads
+	uint32_t sh_imem_changed = 0; // ... of which the DMA changed bytes (and therefore dirtied)
+#endif
 };
 
 enum ReturnMode

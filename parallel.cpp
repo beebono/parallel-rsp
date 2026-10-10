@@ -7,6 +7,9 @@
 
 #include "m64p_plugin.h"
 #include "rsp_1.1.h"
+#ifdef PRSP_SHADOW
+#include "shadow.hpp"
+#endif
 
 #define RSP_PARALLEL_VERSION 0x0101
 #define RSP_PLUGIN_API_VERSION 0x020000
@@ -50,19 +53,22 @@ extern "C"
 	}
 #endif
 
-	EXPORT unsigned int CALL parallelRSPDoRspCycles(unsigned int cycles)
+	extern "C++"
+	{
+	template <typename CPUType>
+	static unsigned int run_rsp_task(CPUType &cpu, unsigned int cycles)
 	{
 		if (*RSP::rsp.SP_STATUS_REG & (SP_STATUS_HALT | SP_STATUS_BROKE))
 			return 0;
 
 		// We don't know if Mupen from the outside invalidated our IMEM.
-		RSP::cpu.invalidate_imem();
+		cpu.invalidate_imem();
 
 		// Run CPU until we either break or we need to fire an IRQ.
-		RSP::cpu.get_state().pc = *RSP::rsp.SP_PC_REG & 0xfff;
+		cpu.get_state().pc = *RSP::rsp.SP_PC_REG & 0xfff;
 
 #ifdef INTENSE_DEBUG
-		fprintf(stderr, "RUN TASK: %u\n", RSP::cpu.get_state().pc);
+		fprintf(stderr, "RUN TASK: %u\n", cpu.get_state().pc);
 		log_rsp_mem_parallel();
 #endif
 
@@ -71,12 +77,12 @@ extern "C"
 
 		while (!(*RSP::rsp.SP_STATUS_REG & SP_STATUS_HALT))
 		{
-			auto mode = RSP::cpu.run();
-			if (mode == RSP::MODE_CHECK_FLAGS && (*RSP::cpu.get_state().cp0.irq & 1))
+			auto mode = cpu.run();
+			if (mode == RSP::MODE_CHECK_FLAGS && (*cpu.get_state().cp0.irq & 1))
 				break;
 		}
 
-		*RSP::rsp.SP_PC_REG = 0x04001000 | (RSP::cpu.get_state().pc & 0xffc);
+		*RSP::rsp.SP_PC_REG = 0x04001000 | (cpu.get_state().pc & 0xffc);
 
 		// RSP_MFC0 forces HALT when the ucode polls SP_STATUS for too long (it is waiting for the CPU). That is not
 		// the same as the ucode halting itself without BREAK (below): after a polling time-out the HALT bit has to be
@@ -90,7 +96,7 @@ extern "C"
 		// From CXD4.
 		if (*RSP::rsp.SP_STATUS_REG & SP_STATUS_BROKE)
 			return cycles;
-		else if (*RSP::cpu.get_state().cp0.irq & 1)
+		else if (*cpu.get_state().cp0.irq & 1)
 			RSP::rsp.CheckInterrupts();
 		else if ((*RSP::rsp.SP_STATUS_REG & SP_STATUS_HALT) && !polling_timed_out)
 			return cycles;
@@ -104,6 +110,28 @@ extern "C"
 		*RSP::rsp.SP_STATUS_REG &= ~SP_STATUS_HALT;
 
 		return cycles;
+	}
+	} // extern "C++"
+
+#ifdef PRSP_SHADOW
+	unsigned do_rsp_cycles_shadow(void *c, unsigned cycles)
+	{
+		return run_rsp_task(*static_cast<RSP::JIT::CPU *>(c), cycles);
+	}
+#endif
+
+	EXPORT unsigned int CALL parallelRSPDoRspCycles(unsigned int cycles)
+	{
+#ifdef PRSP_SHADOW
+		if (RSP::Shadow::enabled() && !(*RSP::rsp.SP_STATUS_REG & (SP_STATUS_HALT | SP_STATUS_BROKE)))
+		{
+			RSP::Shadow::begin();
+			unsigned int r = run_rsp_task(RSP::cpu, cycles);
+			RSP::Shadow::end();
+			return r;
+		}
+#endif
+		return run_rsp_task(RSP::cpu, cycles);
 	}
 
 	EXPORT m64p_error CALL parallelRSPPluginGetVersion(m64p_plugin_type *PluginType, int *PluginVersion,
@@ -168,5 +196,8 @@ extern "C"
 		RSP::cpu.set_dmem(reinterpret_cast<uint32_t *>(Rsp_Info.DMEM));
 		RSP::cpu.set_imem(reinterpret_cast<uint32_t *>(Rsp_Info.IMEM));
 		RSP::cpu.set_rdram(reinterpret_cast<uint32_t *>(Rsp_Info.RDRAM));
+#ifdef PRSP_SHADOW
+		RSP::Shadow::init();
+#endif
 	}
 }
