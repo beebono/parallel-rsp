@@ -1,5 +1,6 @@
 #include "rsp_jit.hpp"
 #include "rsp_disasm.hpp"
+#include "prsp_hooks.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <utility>
@@ -60,8 +61,9 @@ extern "C" void prsp_prof_slow(unsigned store, unsigned op, unsigned e, unsigned
 {
 	prsp_prof_slow_detail[store][op][e][addr & 15]++;
 }
-extern "C" void prsp_prof_hit(unsigned id)
+extern "C" void prsp_prof_hit(unsigned id PRSP_HOOK_HIT_PARAM)
 {
+	PRSP_HOOK_HIT();
 	prsp_prof_cnt[id]++;
 	bool vu = id < 1024, ls = id >= 1024 && id < 1088;
 	if (vu) prsp_prof_cur_vu++; else { if (prsp_prof_cur_vu) prsp_prof_run_vu[prsp_prof_cur_vu > 63 ? 63 : prsp_prof_cur_vu]++; prsp_prof_cur_vu = 0; }
@@ -135,6 +137,7 @@ void CPU::invalidate_code()
 	if (!state.dirty_blocks)
 		return;
 
+	PRSP_HOOK_INVALIDATE(unsigned(__builtin_popcount(state.dirty_blocks)));
 	for (unsigned i = 0; i < CODE_BLOCKS; i++)
 	{
 		if (state.dirty_blocks & (1 << i))
@@ -484,6 +487,7 @@ void CPU::init_vu_stubs()
 		memcpy(area + pos, st.src, st.words * sizeof(uint32_t));
 		area[pos + st.words] = 0xd65f03c0u; // ret
 		st.addr = area + pos;
+		PRSP_HOOK_MISC('S', st.addr, (st.words + 1) * sizeof(uint32_t), rsp_vu_stub_name[i]);
 		pos += st.words + 1;
 	}
 	dump_code(area, total * sizeof(uint32_t));
@@ -1157,6 +1161,7 @@ void CPU::init_jit_thunks()
 
 	thunks.enter_frame = reinterpret_cast<int (*)(void *)>(jit_emit());
 	dump_code(thunk_code, code_size);
+	PRSP_HOOK_MISC('T', thunk_code, code_size, "thunks");
 	thunks.enter_thunk = jit_address(entry_label);
 	thunks.return_thunk = jit_address(return_label);
 
@@ -1178,6 +1183,7 @@ Func CPU::get_jit_block(uint32_t pc)
 
 	if (!block)
 	{
+		PRSP_HOOK_ONLY(const uint64_t prsp_t0 = PRSP_HOOK_NOW(); uint64_t prsp_tc = 0;)
 		unsigned end = (pc + (CODE_BLOCK_SIZE * 2)) >> CODE_BLOCK_SIZE_LOG2;
 		end <<= CODE_BLOCK_SIZE_LOG2 - 2;
 		end = min(end, unsigned(IMEM_SIZE >> 2));
@@ -1188,7 +1194,12 @@ Func CPU::get_jit_block(uint32_t pc)
 		if (ptr)
 			block = ptr;
 		else
+		{
+			PRSP_HOOK_ONLY(const uint64_t prsp_c0 = PRSP_HOOK_NOW();)
 			block = ptr = jit_region(hash, word_pc, end - word_pc);
+			PRSP_HOOK_ONLY(prsp_tc = PRSP_HOOK_NOW() - prsp_c0;)
+		}
+		PRSP_HOOK_LOOKUP(prsp_t0, prsp_tc, end - word_pc);
 #ifdef PRSP_SHADOW
 		sh_block_rec[reinterpret_cast<const void *>(block)] = { word_pc, end - word_pc, hash };
 #endif
@@ -1637,6 +1648,7 @@ void CPU::jit_instruction(jit_state_t *_jit, uint32_t pc, uint32_t instr,
 		regs.flush_caller_save_registers(_jit);
 		jit_begin_call(_jit);
 		jit_pushargi(pid);
+		PRSP_HOOK_HIT_PUSH(pc, instr);
 		jit_end_call(_jit, reinterpret_cast<jit_pointer_t>(prsp_prof_hit));
 	}
 #endif
@@ -2745,6 +2757,7 @@ Func CPU::jit_region(uint64_t hash, unsigned pc_word, unsigned instruction_count
 
 	InstructionInfo last_info = {};
 	InstructionInfo first_info = {};
+	PRSP_HOOK_REGION_DECL();
 
 	for (unsigned i = 0; i < instruction_count; i++)
 	{
@@ -2779,6 +2792,7 @@ Func CPU::jit_region(uint64_t hash, unsigned pc_word, unsigned instruction_count
 #endif
 
 		InstructionInfo inst_info = {};
+		PRSP_HOOK_REGION_MARK();
 		jit_instruction(_jit, (pc_word + i) << 2, instr, inst_info, last_info, i == 0,
 		                (i + 1 < instruction_count) && block_entry[i + 1]);
 
@@ -2811,6 +2825,7 @@ Func CPU::jit_region(uint64_t hash, unsigned pc_word, unsigned instruction_count
 		last_info = inst_info;
 	}
 
+	PRSP_HOOK_REGION_MARK();
 	regs.flush_register_window(_jit);
 
 	// Jump to another block.
@@ -2840,6 +2855,7 @@ Func CPU::jit_region(uint64_t hash, unsigned pc_word, unsigned instruction_count
 	jit_set_code(block_code, code_size);
 
 	auto ret = reinterpret_cast<Func>(jit_emit());
+	PRSP_HOOK_REGION_OFFS(block_code);
 
 	// The size estimate is generous: return the unused tail so regions pack tightly.
 	{
@@ -2850,6 +2866,7 @@ Func CPU::jit_region(uint64_t hash, unsigned pc_word, unsigned instruction_count
 		code_size = jit_word_t(used);
 	}
 	dump_code(block_code, code_size);
+	PRSP_HOOK_REGION_CALL(block_code, code_size, pc_word, instruction_count, hash);
 
 #ifdef TRACE_DISASM
 	printf(" === DISASM ===\n");

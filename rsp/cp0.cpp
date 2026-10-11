@@ -1,4 +1,5 @@
 #include "../state.hpp"
+#include "../prsp_hooks.h"
 #include <string.h>
 
 #ifdef PARALLEL_INTEGRATION
@@ -130,6 +131,7 @@ extern "C"
 #ifdef PRSP_SHADOW
 			rsp->sh_imem_blocks++;
 #endif
+			PRSP_HOOK_IMEM_DMA(1, memcmp(dst, from, b1 - b0) != 0);
 			if (rsp->imem_skip_identical && !memcmp(dst, from, b1 - b0))
 				continue;
 #ifdef PRSP_SHADOW
@@ -163,6 +165,7 @@ extern "C"
 		unsigned i = 0;
 		uint32_t source = *rsp->cp0.cr[CP0_REGISTER_DMA_DRAM];
 		uint32_t dest = *rsp->cp0.cr[CP0_REGISTER_DMA_CACHE];
+		PRSP_HOOK_ONLY(const bool prsp_to_imem = (dest & 0x1000) != 0;)
 
 #ifdef INTENSE_DEBUG
 		fprintf(stderr, "DMA READ: (0x%x <- 0x%x) len %u, count %u, skip %u\n", dest & 0x1ffc, source & 0x7ffffc,
@@ -206,6 +209,7 @@ extern "C"
 		*rsp->cp0.cr[CP0_REGISTER_DMA_DRAM] = source;
 		*rsp->cp0.cr[CP0_REGISTER_DMA_CACHE] = dest;
 		*rsp->cp0.cr[CP0_REGISTER_DMA_READ_LENGTH] = 0xff8;
+		PRSP_HOOK_DMA(0, length * (count + 1), prsp_to_imem);
 
 #ifdef INTENSE_DEBUG
 		log_rsp_mem_parallel();
@@ -276,6 +280,7 @@ extern "C"
 		*rsp->cp0.cr[CP0_REGISTER_DMA_CACHE] = source;
 		*rsp->cp0.cr[CP0_REGISTER_DMA_DRAM] = dest;
 		*rsp->cp0.cr[CP0_REGISTER_DMA_WRITE_LENGTH] = 0xff8;
+		PRSP_HOOK_DMA(1, length * (count + 1), 0);
 #ifdef INTENSE_DEBUG
 		log_rsp_mem_parallel();
 #endif
