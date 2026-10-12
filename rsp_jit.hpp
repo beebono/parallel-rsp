@@ -172,6 +172,7 @@ public:
 		unsigned pc_word = 0;
 		unsigned cookie = 0;
 		unsigned dep_lo = 0, dep_hi = 0; // byte range, hi <= lo: none
+		unsigned dep2_lo = 0, dep2_hi = 0;
 		Func jit = nullptr; // the JIT's own region for the entry pc (compiled on demand, dropped with the stub)
 		bool installed = false;
 	};

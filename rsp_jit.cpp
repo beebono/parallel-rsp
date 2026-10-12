@@ -3073,6 +3073,8 @@ Func CPU::native_lookup(unsigned word_pc)
 	s->cookie = m.cookie;
 	s->dep_lo = m.dep_lo;
 	s->dep_hi = m.dep_hi;
+	s->dep2_lo = m.dep2_lo;
+	s->dep2_hi = m.dep2_hi;
 	s->jit = nullptr;
 	if (!s->installed)
 	{
@@ -3114,11 +3116,16 @@ void CPU::native_invalidate(uint32_t dirty)
 		const unsigned w = native_installed[i];
 		NativeStub &s = native_stubs[w];
 		bool drop = blocks[w] != s.code; // the generic invalidation already removed it
-		if (!drop && s.dep_hi > s.dep_lo)
+		if (!drop)
 		{
-			const unsigned b0 = s.dep_lo >> CODE_BLOCK_SIZE_LOG2, b1 = (s.dep_hi - 1) >> CODE_BLOCK_SIZE_LOG2;
-			const uint32_t mask = (b1 >= 31 ? 0xffffffffu : ((1u << (b1 + 1)) - 1)) & ~((1u << b0) - 1);
-			drop = (dirty & mask) != 0;
+			auto overlaps = [dirty](unsigned lo, unsigned hi) {
+				if (hi <= lo)
+					return false;
+				const unsigned b0 = lo >> CODE_BLOCK_SIZE_LOG2, b1 = (hi - 1) >> CODE_BLOCK_SIZE_LOG2;
+				const uint32_t mask = (b1 >= 31 ? 0xffffffffu : ((1u << (b1 + 1)) - 1)) & ~((1u << b0) - 1);
+				return (dirty & mask) != 0;
+			};
+			drop = overlaps(s.dep_lo, s.dep_hi) || overlaps(s.dep2_lo, s.dep2_hi);
 		}
 		if (drop)
 		{

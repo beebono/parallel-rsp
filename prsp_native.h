@@ -39,6 +39,7 @@ typedef struct PrspNativeMatch
 {
 	unsigned cookie;           // the host's id of the routine; passed back to enter()
 	unsigned dep_lo, dep_hi;   // IMEM byte range [lo, hi) the decision depended on, besides the region itself (hi <= lo: none)
+	unsigned dep2_lo, dep2_hi; // a second range (hi <= lo: none): the stub is dropped when a changed block overlaps either, not the gap between them
 } PrspNativeMatch;
 
 // Side effects the SP registers can have, in program order. Recorded while prsp_native_record(1) is on, by RSP_MTC0 and the DMA code,
