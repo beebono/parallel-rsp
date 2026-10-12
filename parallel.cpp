@@ -7,6 +7,7 @@
 
 #include "m64p_plugin.h"
 #include "rsp_1.1.h"
+#include "prsp_rdp_defer.h"
 #ifdef PRSP_SHADOW
 #include "shadow.hpp"
 #endif
@@ -82,6 +83,7 @@ extern "C"
 				break;
 		}
 
+		PRSP_RDP_DEFER_FLUSH(PRSP_RDP_FLUSH_RUN_END);
 		*RSP::rsp.SP_PC_REG = 0x04001000 | (cpu.get_state().pc & 0xffc);
 
 		// RSP_MFC0 forces HALT when the ucode polls SP_STATUS for too long (it is waiting for the CPU). That is not

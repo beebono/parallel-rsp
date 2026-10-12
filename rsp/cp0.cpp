@@ -1,5 +1,6 @@
 #include "../state.hpp"
 #include "../prsp_hooks.h"
+#include "../prsp_rdp_defer.h"
 #include <string.h>
 
 #ifdef PARALLEL_INTEGRATION
@@ -235,6 +236,7 @@ extern "C"
 
 		uint32_t dest = *rsp->cp0.cr[CP0_REGISTER_DMA_DRAM];
 		uint32_t source = *rsp->cp0.cr[CP0_REGISTER_DMA_CACHE];
+		PRSP_RDP_DEFER_DMA_WRITE(dest, length, skip, count);
 
 #ifdef INTENSE_DEBUG
 		fprintf(stderr, "DMA WRITE: (0x%x <- 0x%x) len %u, count %u, skip %u\n", dest & 0x7ffffc, source & 0x1ffc,
@@ -325,6 +327,7 @@ extern "C"
 			break;
 
 		case CP0_REGISTER_CMD_START:
+			PRSP_RDP_DEFER_FLUSH(PRSP_RDP_FLUSH_START);
 #ifdef INTENSE_DEBUG
 			fprintf(stderr, "CMD_START 0x%x\n", val & 0xfffffff8u);
 #endif
@@ -348,6 +351,7 @@ extern "C"
 			break;
 
 		case CP0_REGISTER_CMD_STATUS:
+			PRSP_RDP_DEFER_FLUSH(PRSP_RDP_FLUSH_STATUS);
 			*rsp->cp0.cr[CP0_REGISTER_CMD_STATUS] &= ~(!!(val & 0x1) << 0);
 			*rsp->cp0.cr[CP0_REGISTER_CMD_STATUS] |= (!!(val & 0x2) << 0);
 			*rsp->cp0.cr[CP0_REGISTER_CMD_STATUS] &= ~(!!(val & 0x4) << 1);
