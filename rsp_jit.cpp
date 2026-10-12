@@ -3098,6 +3098,8 @@ Func CPU::native_enter(NativeStub *s)
 				state.native_mode = uint32_t(mode);
 				return nullptr;
 			}
+			if (Func f = blocks[state.pc >> 2])
+				return f;
 			return get_jit_block(state.pc);
 		}
 	}

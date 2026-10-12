@@ -487,12 +487,6 @@ std::string disassemble(uint32_t pc, uint32_t instr)
 	case 050: // SB
 	{
 		unsigned rt = (instr >> 16) & 31;
-		if (rt == 0)
-		{
-			DISASM_NOP();
-			break;
-		}
-
 		int16_t simm = int16_t(instr);
 		unsigned rs = (instr >> 21) & 31;
 		DISASM("sb %s, %d(%s)", NAME(rt), simm, NAME(rs));
@@ -502,12 +496,6 @@ std::string disassemble(uint32_t pc, uint32_t instr)
 	case 051: // SH
 	{
 		unsigned rt = (instr >> 16) & 31;
-		if (rt == 0)
-		{
-			DISASM_NOP();
-			break;
-		}
-
 		int16_t simm = int16_t(instr);
 		unsigned rs = (instr >> 21) & 31;
 		DISASM("sh %s, %d(%s)", NAME(rt), simm, NAME(rs));
@@ -517,12 +505,6 @@ std::string disassemble(uint32_t pc, uint32_t instr)
 	case 053: // SW
 	{
 		unsigned rt = (instr >> 16) & 31;
-		if (rt == 0)
-		{
-			DISASM_NOP();
-			break;
-		}
-
 		int16_t simm = int16_t(instr);
 		unsigned rs = (instr >> 21) & 31;
 		DISASM("sw %s, %d(%s)", NAME(rt), simm, NAME(rs));
