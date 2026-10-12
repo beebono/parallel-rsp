@@ -11,6 +11,9 @@
 #include "rsp_op.hpp"
 #include "state.hpp"
 #include "jit_allocator.hpp"
+#ifdef PRSP_NATIVE
+#include "prsp_native.h"
+#endif
 
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(PARALLEL_RSP_NO_VU_FAST)
 // aarch64: VU ops are emitted as register-convention bodies (rsp/vu_inline.cpp) instead of RSP_Vxxx helper calls.
@@ -161,11 +164,52 @@ public:
 
 	Func get_jit_block(uint32_t pc);
 
+#ifdef PRSP_NATIVE
+	// Native-routine hook (prsp_native.h). A stub is the block that sits in blocks[] at the entry pc of a matched routine.
+	struct NativeStub
+	{
+		const void *code = nullptr; // the stub's code, entered like any block
+		unsigned pc_word = 0;
+		unsigned cookie = 0;
+		unsigned dep_lo = 0, dep_hi = 0; // byte range, hi <= lo: none
+		Func jit = nullptr; // the JIT's own region for the entry pc (compiled on demand, dropped with the stub)
+		bool installed = false;
+	};
+	void native_install(const PrspNativeHost *host);
+	void native_set_pcs(const uint16_t *entries, unsigned n_entries, const uint16_t *splits, unsigned n_splits);
+	Func native_enter(NativeStub *stub); // from the stub's thunk: the block to continue in, or null to leave the run loop with native_mode
+	int native_oracle(unsigned entry_pc, unsigned stop_pc);
+	void native_resync()
+	{
+		invalidate_imem();
+		invalidate_code();
+	}
+#endif
+
 private:
 	CPUState state;
 	Func blocks[IMEM_WORDS] = {};
 
 	void invalidate_code();
+
+#ifdef PRSP_NATIVE
+	const PrspNativeHost *native_host = nullptr;
+	bool native_busy = false; // inside the oracle: stubs decline
+	bool native_entry[IMEM_WORDS] = {};
+	bool native_split[IMEM_WORDS] = {};
+	bool native_have_splits = false;
+	std::unordered_map<unsigned, NativeStub> native_stubs;
+	std::unordered_map<unsigned, const void *> native_stops;
+	std::vector<unsigned> native_installed; // word pcs whose stub is in blocks[]
+	std::vector<unsigned> native_entry_words;
+	Func native_lookup(unsigned word_pc); // get_jit_block, on a miss: a stub if a routine applies
+	unsigned native_cap_end(unsigned word_pc, unsigned end) const; // no region extends across a split pc
+	NativeStub *native_stub(unsigned word_pc);
+	Func native_region(unsigned word_pc); // the compiled region for word_pc, never a stub
+	const void *native_stop_stub(unsigned word_pc);
+	void native_invalidate(uint32_t dirty);
+	void native_drop_all();
+#endif
 
 #ifdef PRSP_SHADOW
 public:
@@ -202,6 +246,9 @@ private:
 
 		Func enter_thunk = nullptr;
 		Func return_thunk = nullptr;
+#ifdef PRSP_NATIVE
+		Func native_thunk = nullptr; // entered from a stub with JIT_R2 = NativeStub *
+#endif
 	} thunks;
 
 	unsigned analyze_static_end(unsigned pc, unsigned end);

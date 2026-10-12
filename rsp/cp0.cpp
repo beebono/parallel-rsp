@@ -16,6 +16,71 @@ extern int SP_STATUS_TIMEOUT;
 
 using namespace RSP;
 
+#ifdef PRSP_NATIVE
+#ifndef PARALLEL_INTEGRATION
+#error PRSP_NATIVE needs PARALLEL_INTEGRATION
+#endif
+#include "../prsp_native.h"
+#include <vector>
+// Native-routine hook (prsp_native.h): recording of the effectful SP register writes, and the sandbox for verification runs.
+namespace
+{
+const PrspNativeHost *nat_host;
+bool nat_rec, nat_sandbox;
+uint64_t nat_dma_hash;
+uint32_t nat_dma_a, nat_dma_b, nat_dma_c;
+struct NatUndo
+{
+	uint32_t addr;
+	std::vector<uint8_t> old;
+};
+std::vector<NatUndo> nat_undo;
+
+inline uint64_t nat_fnv(uint64_t h, const void *p, size_t n)
+{
+	const uint8_t *b = static_cast<const uint8_t *>(p);
+	for (size_t i = 0; i < n; i++)
+		h = (h ^ b[i]) * 0x100000001b3ull;
+	return h;
+}
+
+inline void nat_emit(uint32_t kind, uint32_t a, uint32_t b, uint32_t c, uint64_t hash)
+{
+	if (nat_host && nat_host->event)
+	{
+		PrspNativeEvent ev = { kind, a, b, c, hash };
+		nat_host->event(nat_host->user, &ev);
+	}
+}
+
+// before / after an SP DMA row is copied to RDRAM (byte address, byte count)
+inline void nat_dma_row_before(RSP::CPUState *rsp, uint32_t addr, uint32_t n)
+{
+	if (nat_sandbox)
+	{
+		NatUndo u;
+		u.addr = addr;
+		u.old.assign(reinterpret_cast<uint8_t *>(rsp->rdram) + addr, reinterpret_cast<uint8_t *>(rsp->rdram) + addr + n);
+		nat_undo.push_back(std::move(u));
+	}
+}
+inline void nat_dma_row_after(RSP::CPUState *rsp, uint32_t addr, uint32_t n)
+{
+	if (nat_rec)
+	{
+		nat_dma_hash = nat_fnv(nat_dma_hash, &addr, 4);
+		nat_dma_hash = nat_fnv(nat_dma_hash, &n, 4);
+		nat_dma_hash = nat_fnv(nat_dma_hash, reinterpret_cast<uint8_t *>(rsp->rdram) + addr, n);
+	}
+}
+} // namespace
+#define NAT_DMA_ROW_BEFORE(addr, n) nat_dma_row_before(rsp, addr, n)
+#define NAT_DMA_ROW_AFTER(addr, n) nat_dma_row_after(rsp, addr, n)
+#else
+#define NAT_DMA_ROW_BEFORE(addr, n) ((void)0)
+#define NAT_DMA_ROW_AFTER(addr, n) ((void)0)
+#endif
+
 extern "C"
 {
 
@@ -236,7 +301,10 @@ extern "C"
 
 		uint32_t dest = *rsp->cp0.cr[CP0_REGISTER_DMA_DRAM];
 		uint32_t source = *rsp->cp0.cr[CP0_REGISTER_DMA_CACHE];
-		PRSP_RDP_DEFER_DMA_WRITE(dest, length, skip, count);
+#ifdef PRSP_NATIVE
+		if (!nat_sandbox)
+#endif
+			PRSP_RDP_DEFER_DMA_WRITE(dest, length, skip, count);
 
 #ifdef INTENSE_DEBUG
 		fprintf(stderr, "DMA WRITE: (0x%x <- 0x%x) len %u, count %u, skip %u\n", dest & 0x7ffffc, source & 0x1ffc,
@@ -252,7 +320,9 @@ extern "C"
 			{
 				const uint32_t *src = (source_start & 0x1000) ? rsp->imem + ((source_start & 0xfff) >> 2)
 				                                              : rsp->dmem + (source_start >> 2);
+				NAT_DMA_ROW_BEFORE(dest_start, length);
 				memcpy(rsp->rdram + (dest_start >> 2), src, length);
+				NAT_DMA_ROW_AFTER(dest_start, length);
 #ifdef PRSP_SHADOW
 				prsp_shadow_dma_write(rsp, dest_start, length);
 #endif
@@ -265,8 +335,10 @@ extern "C"
 					uint32_t source_addr = (source + j) & 0x1FFC;
 					uint32_t dest_addr = (dest + j) & 0x7FFFFC;
 
+					NAT_DMA_ROW_BEFORE(dest_addr, 4);
 					rsp->rdram[dest_addr >> 2] =
 					    (source_addr & 0x1000) ? rsp->imem[(source_addr & 0xfff) >> 2] : rsp->dmem[source_addr >> 2];
+					NAT_DMA_ROW_AFTER(dest_addr, 4);
 #ifdef PRSP_SHADOW
 					prsp_shadow_dma_write(rsp, dest_addr, 4);
 #endif
@@ -305,6 +377,10 @@ extern "C"
 
 		case CP0_REGISTER_DMA_READ_LENGTH:
 			*rsp->cp0.cr[CP0_REGISTER_DMA_READ_LENGTH] = val;
+#ifdef PRSP_NATIVE
+			if (nat_rec)
+				nat_emit(PRSP_EV_DMA_RD, *rsp->cp0.cr[CP0_REGISTER_DMA_CACHE], *rsp->cp0.cr[CP0_REGISTER_DMA_DRAM], val, 0);
+#endif
 #ifdef PARALLEL_INTEGRATION
 			return rsp_dma_read(rsp);
 #else
@@ -313,21 +389,44 @@ extern "C"
 
 		case CP0_REGISTER_DMA_WRITE_LENGTH:
 			*rsp->cp0.cr[CP0_REGISTER_DMA_WRITE_LENGTH] = val;
+#ifdef PRSP_NATIVE
+			nat_dma_hash = 0xcbf29ce484222325ull;
+			nat_dma_a = *rsp->cp0.cr[CP0_REGISTER_DMA_CACHE];
+			nat_dma_b = *rsp->cp0.cr[CP0_REGISTER_DMA_DRAM];
+			nat_dma_c = val;
+#endif
 #ifdef PARALLEL_INTEGRATION
 			rsp_dma_write(rsp);
+#endif
+#ifdef PRSP_NATIVE
+			if (nat_rec)
+				nat_emit(PRSP_EV_DMA_WR, nat_dma_a, nat_dma_b, nat_dma_c, nat_dma_hash);
 #endif
 			break;
 
 		case CP0_REGISTER_SP_STATUS:
+#ifdef PRSP_NATIVE
+			if (nat_rec)
+				nat_emit(PRSP_EV_STATUS, val, 0, 0, 0);
+#endif
 			return rsp_status_write(rsp, val);
 
 		case CP0_REGISTER_SP_SEMAPHORE:
+#ifdef PRSP_NATIVE
+			if (nat_rec)
+				nat_emit(PRSP_EV_SEMAPHORE, val, 0, 0, 0);
+#endif
 			// Any write to the semaphore register, regardless of value, sets it to 0 for the next read
 			*rsp->cp0.cr[CP0_REGISTER_SP_SEMAPHORE] = 0;
 			break;
 
 		case CP0_REGISTER_CMD_START:
-			PRSP_RDP_DEFER_FLUSH(PRSP_RDP_FLUSH_START);
+#ifdef PRSP_NATIVE
+			if (nat_rec)
+				nat_emit(PRSP_EV_CMD_START, val & 0xfffffff8u, 0, 0, 0);
+			if (!nat_sandbox)
+#endif
+				PRSP_RDP_DEFER_FLUSH(PRSP_RDP_FLUSH_START);
 #ifdef INTENSE_DEBUG
 			fprintf(stderr, "CMD_START 0x%x\n", val & 0xfffffff8u);
 #endif
@@ -339,10 +438,28 @@ extern "C"
 #ifdef INTENSE_DEBUG
 			fprintf(stderr, "CMD_END 0x%x\n", val & 0xfffffff8u);
 #endif
+#ifdef PRSP_NATIVE
+			if (nat_rec)
+			{
+				const uint32_t cur = *rsp->cp0.cr[CP0_REGISTER_CMD_CURRENT], end = val & 0xfffffff8u;
+				const uint32_t st = *rsp->cp0.cr[CP0_REGISTER_CMD_STATUS];
+				uint64_t h = 0xcbf29ce484222325ull;
+				if (end > cur && end - cur <= (1u << 20))
+					for (uint32_t a = cur; a < end; a += 4)
+					{
+						const uint32_t w = (st & 1) ? rsp->dmem[(a & 0xfff) >> 2] : rsp->rdram[(a & 0x7ffffc) >> 2];
+						h = nat_fnv(h, &w, 4);
+					}
+				nat_emit(PRSP_EV_CMD_END, cur, end, st, h);
+			}
+#endif
 			*rsp->cp0.cr[CP0_REGISTER_CMD_END] = val & 0xfffffff8u;
 
 #ifdef PARALLEL_INTEGRATION
-			RSP::rsp.ProcessRdpList();
+#ifdef PRSP_NATIVE
+			if (!nat_sandbox)
+#endif
+				RSP::rsp.ProcessRdpList();
 #endif
 			break;
 
@@ -351,7 +468,12 @@ extern "C"
 			break;
 
 		case CP0_REGISTER_CMD_STATUS:
-			PRSP_RDP_DEFER_FLUSH(PRSP_RDP_FLUSH_STATUS);
+#ifdef PRSP_NATIVE
+			if (nat_rec)
+				nat_emit(PRSP_EV_CMD_STATUS, val, 0, 0, 0);
+			if (!nat_sandbox)
+#endif
+				PRSP_RDP_DEFER_FLUSH(PRSP_RDP_FLUSH_STATUS);
 			*rsp->cp0.cr[CP0_REGISTER_CMD_STATUS] &= ~(!!(val & 0x1) << 0);
 			*rsp->cp0.cr[CP0_REGISTER_CMD_STATUS] |= (!!(val & 0x2) << 0);
 			*rsp->cp0.cr[CP0_REGISTER_CMD_STATUS] &= ~(!!(val & 0x4) << 1);
@@ -376,3 +498,31 @@ extern "C"
 		return MODE_CONTINUE;
 	}
 }
+
+#ifdef PRSP_NATIVE
+extern "C"
+{
+	void prsp_native_cp0_host(const PrspNativeHost *host)
+	{
+		nat_host = host;
+		nat_rec = nat_sandbox = false;
+		nat_undo.clear();
+	}
+
+	void prsp_native_record(int on)
+	{
+		nat_rec = on != 0;
+	}
+
+	void prsp_native_sandbox(int on)
+	{
+		if (!on && nat_sandbox)
+		{
+			for (size_t i = nat_undo.size(); i-- > 0;)
+				memcpy(reinterpret_cast<uint8_t *>(RSP::rsp.RDRAM) + nat_undo[i].addr, nat_undo[i].old.data(), nat_undo[i].old.size());
+			nat_undo.clear();
+		}
+		nat_sandbox = on != 0;
+	}
+}
+#endif

@@ -138,6 +138,9 @@ struct CPUState
 	alignas(16) uint8_t iota[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
 	// Bit weights for the inlined CFC2 (movemask of the packed flag lanes).
 	alignas(16) uint8_t flag_weights[16] = { 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128 };
+#ifdef PRSP_NATIVE
+	uint32_t native_mode = 0; // ReturnMode a native routine's stub leaves the run loop with (prsp_native.h)
+#endif
 #ifdef PRSP_SHADOW
 	// Statistics of the shadow-verification build (shadow.cpp), counted by the generated code / the DMA.
 	uint32_t sh_div_ops = 0; // executed VRCP / VRCPL / VRSQ / VRSQL
@@ -154,6 +157,10 @@ enum ReturnMode
 	MODE_BREAK = 2,
 	MODE_DMA_READ = 3,
 	MODE_CHECK_FLAGS = 4
+#ifdef PRSP_NATIVE
+	,
+	MODE_NATIVE_STOP = 5 // the oracle (prsp_native.h) reached its stop pc
+#endif
 };
 
 } // namespace RSP

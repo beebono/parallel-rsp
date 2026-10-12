@@ -147,6 +147,9 @@ void CPU::invalidate_code()
 		}
 	}
 
+#ifdef PRSP_NATIVE
+	native_invalidate(state.dirty_blocks);
+#endif
 	state.dirty_blocks = 0;
 }
 
@@ -326,6 +329,13 @@ extern "C"
 #endif
 		return static_cast<CPU *>(cpu)->get_jit_block(pc);
 	}
+
+#ifdef PRSP_NATIVE
+	static Func rsp_native_enter(void *cpu, void *stub)
+	{
+		return static_cast<CPU *>(cpu)->native_enter(static_cast<CPU::NativeStub *>(stub));
+	}
+#endif
 
 	static jit_word_t rsp_unaligned_lh(const uint8_t *dram, jit_word_t addr)
 	{
@@ -1151,6 +1161,26 @@ void CPU::init_jit_thunks()
 	// Return status. This register is considered common for all thunks.
 	jit_retr(JIT_REGISTER_MODE);
 
+#ifdef PRSP_NATIVE
+	// Entered from a native-routine stub (a block at the routine's entry pc) with JIT_R2 = the stub. native_enter() returns the block to
+	// continue in (the next pc's block after the host ran the routine, or the JIT's own region when it declined), or null to leave the
+	// run loop with the mode and pc native_enter() stored in the state.
+	auto *native_label = jit_indirect();
+	jit_prepare();
+	jit_pushargr(JIT_REGISTER_STATE);
+	jit_pushargr(JIT_R2);
+	jit_finishi(reinterpret_cast<jit_pointer_t>(rsp_native_enter));
+	jit_retval(JIT_REGISTER_NEXT_PC);
+	auto *native_leave = jit_beqi(JIT_REGISTER_NEXT_PC, 0);
+	jit_clear_illegal_cond_branch_taken(_jit, JIT_REGISTER_MODE);
+	jit_stxi_i(offsetof(CPUState, sr) + RegisterCache::COND_BRANCH_TAKEN * 4, JIT_REGISTER_STATE, JIT_REGISTER_MODE);
+	jit_jmpr(JIT_REGISTER_NEXT_PC);
+	jit_patch(native_leave);
+	jit_ldxi_i(JIT_REGISTER_MODE, JIT_REGISTER_STATE, offsetof(CPUState, native_mode));
+	jit_ldxi_i(JIT_REGISTER_NEXT_PC, JIT_REGISTER_STATE, offsetof(CPUState, pc));
+	jit_patch_at(jit_jmpi(), return_label);
+#endif
+
 	jit_realize();
 	jit_word_t code_size;
 	jit_get_code(&code_size);
@@ -1164,6 +1194,9 @@ void CPU::init_jit_thunks()
 	PRSP_HOOK_MISC('T', thunk_code, code_size, "thunks");
 	thunks.enter_thunk = jit_address(entry_label);
 	thunks.return_thunk = jit_address(return_label);
+#ifdef PRSP_NATIVE
+	thunks.native_thunk = jit_address(native_label);
+#endif
 
 	//printf(" === DISASM ===\n");
 	//jit_disassemble();
@@ -1184,9 +1217,18 @@ Func CPU::get_jit_block(uint32_t pc)
 	if (!block)
 	{
 		PRSP_HOOK_ONLY(const uint64_t prsp_t0 = PRSP_HOOK_NOW(); uint64_t prsp_tc = 0;)
+#ifdef PRSP_NATIVE
+		if (native_host && native_entry[word_pc] && !native_busy)
+			if (Func stub = native_lookup(word_pc))
+				return block = stub;
+#endif
 		unsigned end = (pc + (CODE_BLOCK_SIZE * 2)) >> CODE_BLOCK_SIZE_LOG2;
 		end <<= CODE_BLOCK_SIZE_LOG2 - 2;
 		end = min(end, unsigned(IMEM_SIZE >> 2));
+#ifdef PRSP_NATIVE
+		if (native_have_splits)
+			end = native_cap_end(word_pc, end);
+#endif
 		end = analyze_static_end(word_pc, end);
 
 		uint64_t hash = hash_imem(word_pc, end - word_pc);
@@ -2881,6 +2923,268 @@ Func CPU::jit_region(uint64_t hash, unsigned pc_word, unsigned instruction_count
 		abort();
 	return ret;
 }
+
+
+#ifdef PRSP_NATIVE
+// ---- native-routine hook (prsp_native.h) ----
+
+void CPU::native_install(const PrspNativeHost *host)
+{
+	native_host = host;
+	if (!host)
+	{
+		native_drop_all();
+		memset(native_entry, 0, sizeof(native_entry));
+		memset(native_split, 0, sizeof(native_split));
+		native_entry_words.clear();
+		native_have_splits = false;
+	}
+}
+
+void CPU::native_set_pcs(const uint16_t *entries, unsigned n_entries, const uint16_t *splits, unsigned n_splits)
+{
+	bool entry[IMEM_WORDS] = {}, split[IMEM_WORDS] = {};
+	for (unsigned i = 0; i < n_entries; i++)
+		entry[(entries[i] & 0xfff) >> 2] = split[(entries[i] & 0xfff) >> 2] = true;
+	for (unsigned i = 0; i < n_splits; i++)
+		split[(splits[i] & 0xfff) >> 2] = true;
+	if (!memcmp(entry, native_entry, sizeof(entry)) && !memcmp(split, native_split, sizeof(split)))
+		return;
+	// compiled regions may span a split pc that is new, and a stub may stand where nothing is an entry any more
+	native_drop_all();
+	memcpy(native_entry, entry, sizeof(entry));
+	memcpy(native_split, split, sizeof(split));
+	native_entry_words.clear();
+	for (unsigned w = 0; w < IMEM_WORDS; w++)
+		if (entry[w])
+			native_entry_words.push_back(w);
+	native_have_splits = n_entries || n_splits;
+}
+
+void CPU::native_drop_all()
+{
+	memset(blocks, 0, sizeof(blocks));
+	for (auto &kv : native_stubs)
+	{
+		kv.second.installed = false;
+		kv.second.jit = nullptr;
+	}
+	native_installed.clear();
+}
+
+unsigned CPU::native_cap_end(unsigned word_pc, unsigned end) const
+{
+	for (unsigned w = word_pc + 1; w < end; w++)
+		if (native_split[w])
+			return w;
+	return end;
+}
+
+CPU::NativeStub *CPU::native_stub(unsigned word_pc)
+{
+	NativeStub &s = native_stubs[word_pc];
+	if (s.code)
+		return &s;
+	s.pc_word = word_pc;
+
+	jit_state_t *_jit = jit_new_state();
+	jit_prolog();
+	jit_tramp(JIT_FRAME_SIZE);
+	jit_movi(JIT_R2, reinterpret_cast<jit_word_t>(&s));
+	jit_patch_abs(jit_jmpi(), thunks.native_thunk);
+	jit_node_t *end_label = jit_indirect();
+	jit_realize();
+	jit_word_t code_size;
+	jit_get_code(&code_size);
+	auto *code = allocator.allocate_code(code_size);
+	if (!code)
+		abort();
+	jit_set_code(code, code_size);
+	jit_emit();
+	size_t used = size_t(static_cast<uint8_t *>(jit_address(end_label)) - static_cast<uint8_t *>(code));
+	if (used == 0 || used > size_t(code_size))
+		used = size_t(code_size);
+	allocator.shrink_last(code, used);
+	dump_code(code, used);
+	jit_clear_state();
+	jit_destroy_state();
+	if (!Allocator::commit_code(code, used))
+		abort();
+	s.code = code;
+	return &s;
+}
+
+const void *CPU::native_stop_stub(unsigned word_pc)
+{
+	auto it = native_stops.find(word_pc);
+	if (it != native_stops.end())
+		return it->second;
+
+	jit_state_t *_jit = jit_new_state();
+	jit_prolog();
+	jit_tramp(JIT_FRAME_SIZE);
+	jit_movi(JIT_REGISTER_NEXT_PC, word_pc << 2);
+	jit_movi(JIT_REGISTER_MODE, MODE_NATIVE_STOP);
+	jit_patch_abs(jit_jmpi(), thunks.return_thunk);
+	jit_node_t *end_label = jit_indirect();
+	jit_realize();
+	jit_word_t code_size;
+	jit_get_code(&code_size);
+	auto *code = allocator.allocate_code(code_size);
+	if (!code)
+		abort();
+	jit_set_code(code, code_size);
+	jit_emit();
+	size_t used = size_t(static_cast<uint8_t *>(jit_address(end_label)) - static_cast<uint8_t *>(code));
+	if (used == 0 || used > size_t(code_size))
+		used = size_t(code_size);
+	allocator.shrink_last(code, used);
+	dump_code(code, used);
+	jit_clear_state();
+	jit_destroy_state();
+	if (!Allocator::commit_code(code, used))
+		abort();
+	native_stops[word_pc] = code;
+	return code;
+}
+
+// The region the JIT compiles for word_pc, as get_jit_block does on a miss, but never a stub and not entered in blocks[].
+Func CPU::native_region(unsigned word_pc)
+{
+	unsigned end = ((word_pc << 2) + (CODE_BLOCK_SIZE * 2)) >> CODE_BLOCK_SIZE_LOG2;
+	end <<= CODE_BLOCK_SIZE_LOG2 - 2;
+	end = min(end, unsigned(IMEM_SIZE >> 2));
+	if (native_have_splits)
+		end = native_cap_end(word_pc, end);
+	end = analyze_static_end(word_pc, end);
+	uint64_t hash = hash_imem(word_pc, end - word_pc);
+	auto &ptr = cached_blocks[word_pc][hash];
+	if (!ptr)
+		ptr = jit_region(hash, word_pc, end - word_pc);
+	return ptr;
+}
+
+Func CPU::native_lookup(unsigned word_pc)
+{
+	PrspNativeMatch m = {};
+	if (!native_host->lookup || !native_host->lookup(native_host->user, word_pc << 2, state.imem, &m))
+		return nullptr;
+	NativeStub *s = native_stub(word_pc);
+	s->cookie = m.cookie;
+	s->dep_lo = m.dep_lo;
+	s->dep_hi = m.dep_hi;
+	s->jit = nullptr;
+	if (!s->installed)
+	{
+		s->installed = true;
+		native_installed.push_back(word_pc);
+	}
+	return const_cast<Func>(s->code);
+}
+
+Func CPU::native_enter(NativeStub *s)
+{
+	if (!state.has_delay_slot && !native_busy && native_host && native_host->enter)
+	{
+		unsigned next_pc = 0;
+		int mode = PRSP_NATIVE_MODE_CONTINUE;
+		if (native_host->enter(native_host->user, s->cookie, s->pc_word << 2, &next_pc, &mode) == PRSP_NATIVE_DONE)
+		{
+			state.pc = next_pc & 0xffc;
+			if (mode != PRSP_NATIVE_MODE_CONTINUE)
+			{
+				state.native_mode = uint32_t(mode);
+				return nullptr;
+			}
+			return get_jit_block(state.pc);
+		}
+	}
+	if (!s->jit)
+		s->jit = native_region(s->pc_word);
+	return s->jit;
+}
+
+void CPU::native_invalidate(uint32_t dirty)
+{
+	if (native_installed.empty())
+		return;
+	size_t keep = 0;
+	for (size_t i = 0; i < native_installed.size(); i++)
+	{
+		const unsigned w = native_installed[i];
+		NativeStub &s = native_stubs[w];
+		bool drop = blocks[w] != s.code; // the generic invalidation already removed it
+		if (!drop && s.dep_hi > s.dep_lo)
+		{
+			const unsigned b0 = s.dep_lo >> CODE_BLOCK_SIZE_LOG2, b1 = (s.dep_hi - 1) >> CODE_BLOCK_SIZE_LOG2;
+			const uint32_t mask = (b1 >= 31 ? 0xffffffffu : ((1u << (b1 + 1)) - 1)) & ~((1u << b0) - 1);
+			drop = (dirty & mask) != 0;
+		}
+		if (drop)
+		{
+			if (blocks[w] == s.code)
+				blocks[w] = nullptr;
+			s.installed = false;
+			s.jit = nullptr;
+		}
+		else
+			native_installed[keep++] = w;
+	}
+	native_installed.resize(keep);
+}
+
+int CPU::native_oracle(unsigned entry_pc, unsigned stop_pc)
+{
+	const unsigned ew = (entry_pc & 0xfff) >> 2, sw = (stop_pc & 0xfff) >> 2;
+	if (ew == sw || native_busy)
+		return -1;
+	NativeStub *s = native_stub(ew);
+	if (!s->jit)
+		s->jit = native_region(ew);
+	Func save_e = blocks[ew], save_s = blocks[sw];
+	const void *stop = native_stop_stub(sw);
+	blocks[ew] = s->jit;
+	blocks[sw] = const_cast<Func>(stop);
+	native_busy = true;
+	state.pc = ew << 2;
+	bool invalidated = false;
+	int ret;
+	for (;;)
+	{
+		ret = enter(state.pc);
+		if (ret == MODE_NATIVE_STOP)
+		{
+			ret = 0;
+			break;
+		}
+		if (ret == MODE_BREAK)
+			break;
+		if (ret == MODE_CHECK_FLAGS || ret == MODE_DMA_READ)
+		{
+			// What the run loop of run_rsp_task does: an interrupt or a halt ends the task, anything else (an SP DMA into IMEM that changed
+			// code) just goes round again, with the invalidation run() starts with.
+			if ((*state.cp0.irq & 1) || (*state.cp0.cr[CP0_REGISTER_SP_STATUS] & SP_STATUS_HALT))
+				break;
+			if (state.dirty_blocks)
+				invalidated = true;
+			invalidate_code();
+			blocks[sw] = const_cast<Func>(stop); // the invalidation may have cleared it
+		}
+	}
+	native_busy = false;
+	blocks[ew] = invalidated && !s->installed ? nullptr : save_e;
+	blocks[sw] = invalidated ? nullptr : save_s;
+	// regions that were compiled at an entry pc meanwhile (the lookup was off) must not stand in the way of its stub
+	for (unsigned w : native_entry_words)
+		if (blocks[w])
+		{
+			auto it = native_stubs.find(w);
+			if (it == native_stubs.end() || blocks[w] != it->second.code)
+				blocks[w] = nullptr;
+		}
+	return ret;
+}
+#endif // PRSP_NATIVE
 
 ReturnMode CPU::run()
 {

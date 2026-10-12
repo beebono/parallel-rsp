@@ -11,6 +11,9 @@
 #ifdef PRSP_SHADOW
 #include "shadow.hpp"
 #endif
+#ifdef PRSP_NATIVE
+#include "prsp_native.h"
+#endif
 
 #define RSP_PARALLEL_VERSION 0x0101
 #define RSP_PLUGIN_API_VERSION 0x020000
@@ -203,3 +206,129 @@ extern "C"
 #endif
 	}
 }
+
+#ifdef PRSP_NATIVE
+// ---- native-routine hook (prsp_native.h) ----
+extern "C"
+{
+	int RSP_MTC0(RSP::CPUState *rsp, unsigned rd, unsigned rt);
+	int RSP_MFC0(RSP::CPUState *rsp, unsigned rt, unsigned rd);
+	void prsp_native_cp0_host(const PrspNativeHost *host);
+
+	void prsp_native_install(const PrspNativeHost *host)
+	{
+		prsp_native_cp0_host(host);
+		RSP::cpu.native_install(host);
+	}
+
+	void prsp_native_set_pcs(const uint16_t *entries, unsigned n_entries, const uint16_t *splits, unsigned n_splits)
+	{
+		RSP::cpu.native_set_pcs(entries, n_entries, splits, n_splits);
+	}
+
+	void prsp_native_view(PrspNativeView *v)
+	{
+		RSP::CPUState &s = RSP::cpu.get_state();
+		v->sr = s.sr;
+		v->vr = reinterpret_cast<uint16_t(*)[8]>(&s.cp2.regs[0]);
+		v->acc = s.cp2.acc.e;
+		v->flags = reinterpret_cast<uint16_t(*)[16]>(&s.cp2.flags[0]);
+		v->div_out = &s.cp2.div_out;
+		v->div_in = &s.cp2.div_in;
+		v->dp_flag = &s.cp2.dp_flag;
+		v->dmem = s.dmem;
+		v->imem = s.imem;
+		v->rdram = s.rdram;
+		for (int i = 0; i < 16; i++)
+			v->cr[i] = s.cp0.cr[i];
+		v->irq = s.cp0.irq;
+		v->mfc0_count = RSP::MFC0_count;
+		v->pc = &s.pc;
+		v->has_delay_slot = &s.has_delay_slot;
+		v->branch_target = &s.branch_target;
+		v->dirty_blocks = &s.dirty_blocks;
+	}
+
+	void prsp_native_save(PrspNativeSnap *o)
+	{
+		RSP::CPUState &s = RSP::cpu.get_state();
+		o->magic = PRSP_NATIVE_SNAP_MAGIC;
+		o->size = sizeof(*o);
+		o->pc = s.pc;
+		o->has_delay_slot = s.has_delay_slot;
+		o->branch_target = s.branch_target;
+		o->irq = *s.cp0.irq;
+		o->dirty_blocks = s.dirty_blocks;
+		o->sp_status_timeout = RSP::SP_STATUS_TIMEOUT;
+		memcpy(o->mfc0_count, RSP::MFC0_count, sizeof(o->mfc0_count));
+		for (int i = 0; i < 16; i++)
+			o->cr[i] = *s.cp0.cr[i];
+		memcpy(o->sr, s.sr, sizeof(o->sr));
+		for (int i = 0; i < 32; i++)
+			memcpy(o->vr[i], s.cp2.regs[i].e, 16);
+		for (int i = 0; i < 3; i++)
+			memcpy(o->flags[i], s.cp2.flags[i].e, 32);
+		memcpy(o->acc, s.cp2.acc.e, 48);
+		o->div_out = s.cp2.div_out;
+		o->div_in = s.cp2.div_in;
+		o->dp_flag = s.cp2.dp_flag;
+		o->pad_[0] = o->pad_[1] = o->pad_[2] = 0;
+		memcpy(o->dmem, s.dmem, 4096);
+		memcpy(o->imem, s.imem, 4096);
+	}
+
+	void prsp_native_load(const PrspNativeSnap *o)
+	{
+		RSP::CPUState &s = RSP::cpu.get_state();
+		s.pc = o->pc;
+		s.has_delay_slot = o->has_delay_slot;
+		s.branch_target = o->branch_target;
+		*s.cp0.irq = o->irq;
+		s.dirty_blocks = o->dirty_blocks;
+		RSP::SP_STATUS_TIMEOUT = o->sp_status_timeout;
+		memcpy(RSP::MFC0_count, o->mfc0_count, sizeof(o->mfc0_count));
+		for (int i = 0; i < 16; i++)
+			*s.cp0.cr[i] = o->cr[i];
+		memcpy(s.sr, o->sr, sizeof(o->sr));
+		for (int i = 0; i < 32; i++)
+			memcpy(s.cp2.regs[i].e, o->vr[i], 16);
+		for (int i = 0; i < 3; i++)
+			memcpy(s.cp2.flags[i].e, o->flags[i], 32);
+		memcpy(s.cp2.acc.e, o->acc, 48);
+		s.cp2.div_out = o->div_out;
+		s.cp2.div_in = o->div_in;
+		s.cp2.dp_flag = o->dp_flag;
+		memcpy(s.dmem, o->dmem, 4096);
+		memcpy(s.imem, o->imem, 4096);
+	}
+
+	void prsp_native_resync(void)
+	{
+		RSP::cpu.native_resync();
+	}
+
+	int prsp_native_oracle(unsigned entry_pc, unsigned stop_pc)
+	{
+		return RSP::cpu.native_oracle(entry_pc, stop_pc);
+	}
+
+	int prsp_native_mtc0(unsigned rd, uint32_t value)
+	{
+		RSP::CPUState &s = RSP::cpu.get_state();
+		const uint32_t keep = s.sr[32];
+		s.sr[32] = value;
+		const int mode = RSP_MTC0(&s, rd, 32);
+		s.sr[32] = keep;
+		return mode;
+	}
+
+	uint32_t prsp_native_mfc0(unsigned rd, unsigned rt, int *mode)
+	{
+		RSP::CPUState &s = RSP::cpu.get_state();
+		const int m = RSP_MFC0(&s, rt, rd);
+		if (mode)
+			*mode = m;
+		return *s.cp0.cr[rd & 15];
+	}
+}
+#endif
