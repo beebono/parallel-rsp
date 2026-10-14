@@ -47,6 +47,8 @@ static inline uint32_t strb(unsigned t, unsigned n, unsigned off) { return 0x390
 // add xD, xN, #imm12
 static inline uint32_t add_imm(unsigned d, unsigned n, unsigned imm) { return 0x91000000u | (imm << 10) | (n << 5) | d; }
 // ror wD, wN, #16 (EXTR wD, wN, wN, #16)
+// ror xD, xN, #32 (extr xD, xN, xN, #32)
+static inline uint32_t ror32_x(unsigned d, unsigned n) { return 0x93c08000u | (n << 16) | (n << 5) | d; }
 static inline uint32_t ror16_w(unsigned d, unsigned n) { return 0x13800000u | (n << 16) | (16u << 10) | (n << 5) | d; }
 // rev32 vD.4h / vD.8h / vD.8b, vN
 static inline uint32_t rev32_4h(unsigned d, unsigned n) { return 0x2e600800u | (n << 5) | d; }

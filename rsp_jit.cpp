@@ -1045,6 +1045,26 @@ void CPU::jit_emit_slow_paths(jit_state_t *_jit)
 	{
 		jit_node_t *slow = jit_label();
 		jit_patch_at(ss.guard, slow);
+		jit_node_t *wrap = nullptr;
+		if (ss.inline_lw)
+		{
+			// Unaligned LW at byte address a (a & 3 != 0): the result is bytes a..a+3 of the big-endian image, i.e. a 32-bit window of
+			// the two consecutive words w0:w1, starting 8 * (a & 3) bits into w0. One 64-bit load gets both words (w0 in the low half,
+			// being at the lower address), ror 32 puts w0 on top. The address and the destination are the only registers used. The
+			// last word of DMEM wraps to the first: left to the helper.
+			const unsigned D = phys_reg(ss.val_reg);
+			jit_andi(ss.val_reg, ss.addr_reg, 0xffc);
+			wrap = jit_beqi(ss.val_reg, 0xffc);
+			jit_ldxr_l(ss.val_reg, JIT_REGISTER_DMEM, ss.val_reg);
+			jit_raw(ror32_x(D, D));
+			jit_andi(ss.addr_reg, ss.addr_reg, 3);
+			jit_lshi(ss.addr_reg, ss.addr_reg, 3);
+			jit_rsbi(ss.addr_reg, ss.addr_reg, 32);
+			jit_rshr_u(ss.val_reg, ss.val_reg, ss.addr_reg);
+			jit_extr_i(ss.val_reg, ss.val_reg);
+			jit_patch_at(jit_jmpi(), ss.cont);
+			jit_patch(wrap);
+		}
 		RegisterCache::emit_spill(_jit, ss.saved, ss.num_saved);
 		jit_begin_call(_jit);
 		jit_pushargr(JIT_REGISTER_DMEM);
@@ -1774,6 +1794,7 @@ void CPU::jit_emit_load_operation(jit_state_t *_jit,
 			ss.store = false;
 			ss.addr_reg = addr;
 			ss.val_reg = rt_reg;
+			ss.inline_lw = (instr >> 26) == 043 || (instr >> 26) == 047;
 			ss.reload_v0 = v0_holds;
 			slow_scalar.push_back(ss);
 		}

@@ -30,6 +30,7 @@ int main(){
   printf("ldrh w16,[x19,#702]\n%08x\n", ldrh(16,19,702)); printf("strh w17,[x19,#194]\n%08x\n", strh(17,19,194));
   printf("ldrb w16,[x19,#703]\n%08x\n", ldrb(16,19,703)); printf("strb w17,[x19,#195]\n%08x\n", strb(17,19,195));
   printf("add x17,x19,#703\n%08x\n", add_imm(17,19,703)); printf("add x16,x20,#0\n%08x\n", add_imm(16,20,0));
+  printf("ror x9,x9,#32\n%08x\n", ror32_x(9,9)); printf("ror x12,x10,#32\n%08x\n", ror32_x(12,10));
   printf("ror w16,w16,#16\n%08x\n", ror16_w(16,16)); printf("ror w3,w5,#16\n%08x\n", ror16_w(3,5));
   printf("rev32 v0.4h,v0.4h\n%08x\n", rev32_4h(0,0)); printf("rev32 v2.8h,v3.8h\n%08x\n", rev32_8h(2,3)); printf("rev32 v1.8b,v4.8b\n%08x\n", rev32_8b(1,4));
   printf("shll v0.8h,v0.8b,#8\n%08x\n", shll_8h_8(0,0)); printf("ushll v2.8h,v5.8b,#7\n%08x\n", ushll_8h_7(2,5));

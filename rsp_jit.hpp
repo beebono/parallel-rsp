@@ -365,6 +365,7 @@ private:
 		bool store;
 		unsigned addr_reg; // masked address (before the endian flip)
 		unsigned val_reg;  // loads: destination, stores: the value
+		bool inline_lw;    // unaligned LW/LWU: a funnel shift of two words, the helper only for the wrap at the end of DMEM
 		RegisterCache::Saved saved[RegisterCache::MaxSaved];
 		unsigned num_saved;
 		int reload_v0;
