@@ -140,6 +140,13 @@ public:
 		vu_fast_enabled = enable;
 	}
 
+	// Test hook: the out-of-line scalar load/store paths clobber every caller-save register and v0 after their helper call, so a
+	// missing spill or reload shows up (the helpers are leaf functions that happen to leave those registers alone).
+	void set_clobber_slow_paths(bool enable)
+	{
+		clobber_slow_paths = enable;
+	}
+
 	// Test hook: the inlined VRCP / VRCPL / VRSQ / VRSQL / CFC2 (default on; only used while the register-convention path is on).
 	void set_div_inline(bool enable)
 	{
@@ -316,6 +323,7 @@ private:
 	VUStub vu_stubs[RSP_VU_STUB_COUNT];
 	bool vu_fast_enabled = true;
 	bool div_inline_enabled = true;
+	bool clobber_slow_paths = false;
 	unsigned vu_inline_words = 8; // VU bodies up to this many words are copied inline instead of called
 	int v0_holds = -1; // vector register whose value v0 currently holds (-1 = unknown)
 	void init_vu_stubs();
@@ -338,6 +346,22 @@ private:
 		unsigned addr_reg;
 	};
 	std::vector<SlowLS> slow_ls;
+
+	// Scalar LH/LHU/LW/SH/SW: the unaligned case calls a C helper out of line (jit_emit_slow_paths), so the aligned case does not
+	// flush the caller-save registers of the cache.
+	struct SlowScalar
+	{
+		jit_node_t *guard;
+		jit_node_t *cont;
+		jit_pointer_t helper;
+		bool store;
+		unsigned addr_reg; // masked address (before the endian flip)
+		unsigned val_reg;  // loads: destination, stores: the value
+		RegisterCache::Saved saved[RegisterCache::MaxSaved];
+		unsigned num_saved;
+		int reload_v0;
+	};
+	std::vector<SlowScalar> slow_scalar;
 	bool jit_emit_ls_fast(jit_state_t *_jit, uint32_t instr);
 	void jit_emit_slow_paths(jit_state_t *_jit);
 #endif

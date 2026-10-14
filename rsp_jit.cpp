@@ -1026,6 +1026,33 @@ void CPU::jit_emit_slow_paths(jit_state_t *_jit)
 		jit_patch_at(jit_jmpi(), sl.cont);
 	}
 	slow_ls.clear();
+
+	for (auto &ss : slow_scalar)
+	{
+		jit_node_t *slow = jit_label();
+		jit_patch_at(ss.guard, slow);
+		RegisterCache::emit_spill(_jit, ss.saved, ss.num_saved);
+		jit_begin_call(_jit);
+		jit_pushargr(JIT_REGISTER_DMEM);
+		jit_pushargr(ss.addr_reg);
+		if (ss.store)
+			jit_pushargr(ss.val_reg);
+		jit_end_call(_jit, ss.helper);
+		if (!ss.store)
+			jit_retval(ss.val_reg);
+		if (clobber_slow_paths)
+		{
+			for (unsigned i = 0; i < JIT_R_NUM; i++)
+				if (unsigned(JIT_R(i)) != ss.val_reg || ss.store)
+					jit_movi(JIT_R(i), 0x5a5a5a5a5a5a5a5aull);
+			jit_raw(movi_16b(0, 0x5a));
+		}
+		RegisterCache::emit_reload(_jit, ss.saved, ss.num_saved);
+		if (ss.reload_v0 >= 0)
+			jit_raw(ldr_q(0, 19, reg_base + ss.reload_v0 * 16));
+		jit_patch_at(jit_jmpi(), ss.cont);
+	}
+	slow_scalar.clear();
 }
 #endif
 
@@ -1543,6 +1570,42 @@ void CPU::jit_emit_store_operation(jit_state_t *_jit,
 	unsigned rt = (instr >> 16) & 31;
 	int16_t simm = int16_t(instr);
 	unsigned rs = (instr >> 21) & 31;
+#ifdef PRSP_VU_FAST
+	if (vu_fast_enabled)
+	{
+		unsigned rt_reg = regs.load_mips_register_noext(_jit, rt);
+		unsigned rs_reg = regs.load_mips_register_noext(_jit, rs);
+		unsigned addr = regs.modify_mips_register(_jit, RegisterCache::SCRATCH_REGISTER0);
+		jit_addi(addr, rs_reg, simm);
+		jit_andi(addr, addr, 0xfffu);
+
+		SlowScalar ss = {};
+		jit_node_t *guard = nullptr;
+		if (align_mask)
+		{
+			ss.num_saved = regs.snapshot_caller_save(ss.saved);
+			guard = jit_bmsi(addr, align_mask);
+		}
+		if (endian_flip != 0)
+			jit_xori(addr, addr, endian_flip);
+		jit_emitter(_jit, addr, JIT_REGISTER_DMEM, rt_reg);
+		if (guard)
+		{
+			ss.guard = guard;
+			ss.cont = jit_label();
+			ss.helper = rsp_unaligned_op;
+			ss.store = true;
+			ss.addr_reg = addr;
+			ss.val_reg = rt_reg;
+			ss.reload_v0 = v0_holds;
+			slow_scalar.push_back(ss);
+		}
+		regs.unlock_mips_register(rt);
+		regs.unlock_mips_register(rs);
+		regs.unlock_mips_register(RegisterCache::SCRATCH_REGISTER0);
+		return;
+	}
+#endif
 	unsigned rt_reg = regs.load_mips_register_noext(_jit, rt);
 	unsigned rs_reg = regs.load_mips_register_noext(_jit, rs);
 	unsigned rs_tmp_reg = regs.modify_mips_register(_jit, RegisterCache::SCRATCH_REGISTER0);
@@ -1606,6 +1669,47 @@ void CPU::jit_emit_load_operation(jit_state_t *_jit,
 
 	int16_t simm = int16_t(instr);
 	unsigned rs = (instr >> 21) & 31;
+#ifdef PRSP_VU_FAST
+	if (vu_fast_enabled)
+	{
+		unsigned rs_reg = regs.load_mips_register_noext(_jit, rs);
+		unsigned addr = regs.modify_mips_register(_jit, RegisterCache::SCRATCH_REGISTER0);
+		jit_addi(addr, rs_reg, simm);
+		jit_andi(addr, addr, 0xfffu);
+		unsigned rt_reg = regs.modify_mips_register(_jit, rt);
+
+		SlowScalar ss = {};
+		jit_node_t *guard = nullptr;
+		if (align_mask)
+		{
+			// The destination is overwritten by the result: it is neither spilled nor reloaded around the call.
+			RegisterCache::Saved all[RegisterCache::MaxSaved];
+			unsigned n = regs.snapshot_caller_save(all);
+			for (unsigned i = 0; i < n; i++)
+				if (all[i].jit_reg != rt_reg)
+					ss.saved[ss.num_saved++] = all[i];
+			guard = jit_bmsi(addr, align_mask);
+		}
+		if (endian_flip != 0)
+			jit_xori(addr, addr, endian_flip);
+		jit_emitter(_jit, rt_reg, JIT_REGISTER_DMEM, addr);
+		if (guard)
+		{
+			ss.guard = guard;
+			ss.cont = jit_label();
+			ss.helper = rsp_unaligned_op;
+			ss.store = false;
+			ss.addr_reg = addr;
+			ss.val_reg = rt_reg;
+			ss.reload_v0 = v0_holds;
+			slow_scalar.push_back(ss);
+		}
+		regs.unlock_mips_register(rs);
+		regs.unlock_mips_register(RegisterCache::SCRATCH_REGISTER0);
+		regs.unlock_mips_register(rt);
+		return;
+	}
+#endif
 	unsigned rs_reg = regs.load_mips_register_noext(_jit, rs);
 	unsigned rs_tmp_reg = regs.modify_mips_register(_jit, RegisterCache::SCRATCH_REGISTER0);
 	jit_addi(rs_tmp_reg, rs_reg, simm);
@@ -1744,6 +1848,9 @@ void CPU::jit_instruction(jit_state_t *_jit, uint32_t pc, uint32_t instr,
 		if ((t == 062 || t == 072) && vu_fast_enabled && jit_emit_ls_fast(_jit, instr))
 			return;
 		bool keeps_v0 = t <= 7 || (t >= 010 && t <= 017);
+		// Scalar loads and stores: the unaligned case reloads v0 after its out-of-line helper call.
+		if (vu_fast_enabled && (t == 040 || t == 041 || t == 043 || t == 044 || t == 045 || t == 047 || t == 050 || t == 051 || t == 053))
+			keeps_v0 = true;
 		if (t == 022 && vu_fast_enabled)
 		{
 			unsigned sub = (instr >> 21) & 31;

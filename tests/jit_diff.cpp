@@ -42,6 +42,7 @@ struct Machine
 		st.cp0.irq = &irq;
 #ifdef PRSP_VU_FAST
 		cpu.set_vu_fast(fast);
+		cpu.set_clobber_slow_paths(fast);
 #endif
 	}
 };
