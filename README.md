@@ -42,19 +42,37 @@ Everything is bit-identical to the code it replaces (checked by the tools in `te
   30-35 instruction sequence (the ROM table is reached from `CPUState`); CFC2 is a NEON movemask into the cached MIPS register. No
   fallback path is needed. 0.04-0.14 ms/frame; together with the IMEM filter, JIT time over nine games is -2.8 %.
   `PRSP_NO_DIV_INLINE=1` disables it.
+- **Scalar load/store, register cache and region exits** (`rsp_jit.cpp`, `lightning/`; only with the register-convention path on). Bit-identical to the
+  previous code generation; the JIT proper gets 2-4 % cheaper (RSP time per frame over the whole `DoRspCycles`: SM64 -3 %, Banjo-Kazooie -2.4 %, OoT -2.6 %, see
+  [docs/results.md](docs/results.md)).
+  - The unaligned case of LH/LHU/LW/SH/SW is an out-of-line slow path (spill, helper call, reload, like the vector loads/stores) instead of an inline
+    call that flushed the caller-save registers of the register cache before every access; loads write their destination directly. An unaligned LW
+    (the most frequent slow-path call) is a funnel shift of two words without a call; only the wrap at the end of DMEM uses the helper.
+  - Scalar accesses with a `$0` base use the static address (one load/store with an immediate offset). `LB` is one `LDRSB` (Lightning's
+    register-offset `ldxr_c` emitted an `sxtb` after it).
+  - The register cache stays live on the not-taken path of a conditional branch (the modified registers are written back, nothing is dropped) unless the
+    next instruction is a block entry.
+  - A region is left through an inline `blocks[]` lookup (a per-site indirect branch) instead of the one shared enter thunk; `PRSP_NO_INLINE_DISPATCH=1`
+    uses the thunk again. Measured neutral to +0.6 % (Banjo-Kazooie): see the bisect notes in results.md.
+  - Lightning fix (`lightning/lib/lightning.c`): on 64-bit the `ldxi_*` nodes did not invalidate the value the optimiser tracks for their destination,
+    so `movi r, c ; ldxi r, ... ; movi r, c` lost the second `movi` (found by the `$0`-base loads).
 - **Debug and verification aids.**
   - `PRSP_SHADOW=1 ./build_m64p_plugin.sh` (`shadow.cpp`): a build that replays every `DoRspCycles` call on a second JIT with the previous
     code paths (`PRSP_SHADOW_MODE=prev|old`) and compares registers, memories, RDP command lists and SP DMA writes to RDRAM, and checks that no
     stale compiled region survives an IMEM change. Summary goes to `PRSP_SHADOW_OUT`. Slower than real time, for verification only.
   - `PRSP_PROFILE=1 ./build_m64p_plugin.sh`: a build with a dynamic instruction-mix profile, VU/LS run lengths and slow-path histograms
-    (`PRSP_PROF_OUT=file`).
+    (`PRSP_PROF_OUT=file`), and the number of calls of each unaligned scalar helper (`unaligned i n`: LH, LW, LHU, SH, SW).
   - `PRSP_DEBUG_VU=1`: print the start-up validation result of every VU body.
   - `PRSP_DUMP_JIT=file`: write an image of the code region (for `objdump -D -b binary -m aarch64`).
   - A/B switches: `PRSP_NO_VU_FAST=1` (helper-call code generation for VU ops, vector loads/stores and COP0/COP2 moves), `PRSP_NO_DIV_INLINE=1`,
-    `PRSP_NO_IMEM_SKIP=1`, and `PRSP_INLINE_WORDS=n` (VU bodies up to n instructions are copied inline, default 8).
+    `PRSP_NO_IMEM_SKIP=1`, `PRSP_NO_INLINE_DISPATCH=1`, and `PRSP_INLINE_WORDS=n` (VU bodies up to n instructions are copied inline, default 8).
 - **Test tools** (`tests/`), all comparing the new code against the code it replaced:
   - `jit_diff.cpp` (CMake `PARALLEL_RSP_JIT_DIFF=ON`, target `rsp-jit-diff`): random RSP programs run through the fast JIT and the helper-call JIT,
-    full state compared; modes `single`, `vu`, `random`, `div` (exhaustive VRCP/VRSQ/CFC2 sweeps), `all`.
+    full state compared; modes `single`, `vu`, `random`, `div` (exhaustive VRCP/VRSQ/CFC2 sweeps), `link` (programs of far-apart segments joined by
+    j / jal / jr / far branches, run twice so the second run finds every region compiled), `all`. Mode `scalar` compares both JITs with a C++ model of
+    the scalar loads/stores instead (it also catches an error that both share, like one in the Lightning backend) and prints the shortest failing
+    prefix; mode `prog` replays one program from `$JD_PROG` / `$JD_REGS`; `JD_TRACE=1` prints every program. The fast machine's out-of-line
+    paths clobber the caller-save registers and `v0` after their helper call (`set_clobber_slow_paths`), so a missing spill or reload shows up.
   - `dma_diff.cpp` / `cp0_reference.cpp` / `dma_diff.sh`: SP DMA and the IMEM dirty bits against a word-by-word reference.
   - `neon_enc_check.sh`: every raw encoder in `rsp/neon_enc.h` against `aarch64-linux-gnu-as`.
 

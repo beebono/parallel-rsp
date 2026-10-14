@@ -189,3 +189,54 @@ All run against the code being replaced, with 0 differences unless a mutation is
 | `PRSP_DUMP_JIT=file` | write an image of the code region (use with `objdump -D -b binary -m aarch64` and `perf script`) |
 | build with `PRSP_SHADOW=1 ./build_m64p_plugin.sh aarch64` | shadow verification, see above (`PRSP_SHADOW_MODE=prev\|old`, `PRSP_SHADOW_OUT=file`); slower than real time in the heavy games, not for timing |
 | build with `PRSP_PROFILE=1 ./build_m64p_plugin.sh aarch64` | dynamic instruction mix, VU / LS run lengths, slow-path histograms (`PRSP_PROF_OUT=file`) |
+
+
+## Scalar memory path, register cache retention, inline region exits (2026-10-13)
+
+Six commits on `m64p-aarch64` after `f4edbfe` (run `git log f4edbfe..` for the exact list); each one was checked with `tests/jit_diff.cpp` (a deliberate error in
+the new code gives mismatches, see the commit messages) and is bit-identical on the device.
+
+| variant | commit | what |
+|---|---|---|
+| v0 | `f4edbfe` | before |
+| v1 | `077eb2d` | LB is one `LDRSB`; unaligned LH/LHU/LW/SH/SW out of line; loads write the destination directly; `v0` kept across scalar loads/stores |
+| v2 | `5e92142` | + Lightning `ldxi` value-tracking fix, `$0`-base accesses with the static address |
+| v3 | `3fa01e7` | + register cache kept on the not-taken path of a conditional branch |
+| v4 | `0b9dd6f` | + inline `blocks[]` lookup at every region exit (`PRSP_NO_INLINE_DISPATCH=1` = off) |
+| v5 | `b54207c` | + unaligned LW as a funnel shift |
+
+**Equivalence** (rgdsplus; `tools/equiv`-style runs of arMLEt built with each variant, `RSPT_HASH`, three screenshots at frames 400 / 1500 / 2400, pad script): the
+per-call RSP state hash stream and the screenshots of v4 are identical to v0 in Super Mario 64, Ocarina of Time, Banjo-Kazooie, Donkey Kong 64, Mario Kart 64, Paper Mario, Pokemon Snap,
+Star Fox 64 and Toy Story 2; v5 is identical to v0 in SM64 and OoT.
+
+**Time** (rgdsplus, performance governor, 1.58 GHz real; arMLEt with rsp-hle audio and parallel-rsp for graphics, foir with 3 workers; RSP time per VI frame over
+frames 1440-2160 from the shim's marks; median of three runs, the variants alternated in a different order in each repetition). The RSP time includes the video
+plugin's synchronous callback (about 1.9-3.7 ms in these scenes, the same for every variant), so the change in the JIT proper is larger than the percentages.
+
+| game | v0 | v1 | v2 | v3 | v4 | v5 |
+|---|---|---|---|---|---|---|
+| Banjo-Kazooie | 6.472 | 6.330 (-2.2 %) | 6.315 (-2.4 %) | 6.278 (-3.0 %) | 6.315 (-2.4 %) | |
+| Super Mario 64 (fast-mode runs, see below) | 4.16 (4 runs) | 4.034 (1 run, -3.0 %) | 4.017 (-3.4 %) | 4.018 (-3.4 %) | 4.01 (5 runs, -3.6 %) | 4.04 (2 runs, -2.9 %) |
+| Ocarina of Time (second set) | 2.786 | | | | 2.725 (-2.2 %) | 2.713 (-2.6 %) |
+
+SM64 runs in one of two modes: most runs take 4.0-4.18 ms (emulation thread 7.06-7.29 ms), some 4.26-4.39 ms (7.9-8.1 ms). The slow mode shows up in every variant
+that was run more than twice (v0 two of six runs, v1 two of three, v4 one of six, v5 one of three), so it is a property of the run (probably where the video plugin's
+worker threads land), not of a build; the SM64 row uses the fast-mode runs only. Banjo-Kazooie and OoT did not show it. The medians of all runs
+(v0 4.176 / 4.167, v1 4.255, v4 4.007 / 4.021, v5 4.047) are what `tim.py`-style summaries give and are dominated by that mode.
+
+Emulation-thread CPU time per frame moves by the same absolute amount (Banjo-Kazooie -0.9 %, SM64 fast mode -1.6 %, OoT -0.8 % at v5) with a larger spread.
+
+**Items that may be detrimental (kept; for a later bisect):**
+- `0b9dd6f` (inline region exits): Banjo-Kazooie 6.278 -> 6.315 ms (+0.6 %, the ranges 6.270-6.308 and 6.303-6.344 just do not overlap), SM64 -0.3 %. The exits grow from 2 to
+  about 11 instructions; the gain of per-site indirect branches did not show. `PRSP_NO_INLINE_DISPATCH=1` is the A/B switch.
+- Nothing else looks detrimental: v1 and v5 in SM64 have only one or two fast-mode runs, which is too few to separate them from v2 / v4 (+0.4 %, +0.7 % over v4), and v5 gains 0.4 % in OoT
+  (where unaligned LW is common) and nothing measurable elsewhere.
+
+**Counts behind the items** (eight `--prof3` runs, rgdsplus, `test-output/session/rgdsplus/F.*`, and `PRSP_PROFILE` counters):
+- scalar loads/stores are 11-15 % of the executed RSP instructions; with a `$0` base 14.8 % of them, with a base built by `lui`/`ori`/`addiu` in the same block only 0.4 % (so only `$0` is specialised);
+- the cache reset at block starts costs an estimated 26 % of the executed instructions in register reloads, half at branch targets and half after a branch with its delay slot (v3 takes
+  the second half for conditional branches; a fixed entry state at branch targets was not attempted);
+- the enter thunks are 1.6 % of the emulation thread's samples in SM64 (4 % of the JIT proper);
+- unaligned scalar helper calls per 1100 frames: SM64 LW 97.8k, SW 97.8k, LHU 15k; OoT LW 312k, LHU 39k, SW 31k; Banjo-Kazooie LHU 51k only (0.2 %, 0.4 %, 2.2 % and 0.2 % of the scalar loads/stores);
+- no task in the eight scenes reaches the 32767 `SP_STATUS` polls of the initial time-out (largest COP0 count of a task: 69k in DK64 over all COP0 instructions), so the first poll-out
+  burning one task per session was not observed and the initial limit is unchanged.
