@@ -276,6 +276,9 @@ private:
 	                     bool first_instruction, bool next_instruction_is_target);
 	void jit_exit(jit_state_t *_jit, uint32_t pc, const InstructionInfo &last_info, ReturnMode mode, bool first_instruction);
 	void jit_exit_dynamic(jit_state_t *_jit, uint32_t pc, const InstructionInfo &last_info, bool first_instruction);
+	// Leave the region for the pc in JIT_REGISTER_NEXT_PC: the blocks[] lookup of the enter thunk done in place (so the final jump is a
+	// per-site indirect branch), the shared thunk only for a block that is not compiled yet.
+	void jit_goto_pc(jit_state_t *_jit);
 	void jit_end_of_block(jit_state_t *_jit, uint32_t pc, const InstructionInfo &last_info);
 
 	void jit_handle_delay_slot(jit_state_t *_jit, const InstructionInfo &last_info, uint32_t base_pc, uint32_t end_pc,
@@ -328,6 +331,7 @@ private:
 	bool vu_fast_enabled = true;
 	bool div_inline_enabled = true;
 	bool clobber_slow_paths = false;
+	bool inline_dispatch_enabled = true;
 	unsigned vu_inline_words = 8; // VU bodies up to this many words are copied inline instead of called
 	int v0_holds = -1; // vector register whose value v0 currently holds (-1 = unknown)
 	void init_vu_stubs();

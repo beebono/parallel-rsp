@@ -114,6 +114,10 @@ CPU::CPU()
 	const char *nodiv = getenv("PRSP_NO_DIV_INLINE");
 	if (nodiv && *nodiv && *nodiv != '0')
 		div_inline_enabled = false;
+	// A/B switch: PRSP_NO_INLINE_DISPATCH=1 leaves every region through the shared enter thunk again.
+	const char *nodisp = getenv("PRSP_NO_INLINE_DISPATCH");
+	if (nodisp && *nodisp && *nodisp != '0')
+		inline_dispatch_enabled = false;
 	if (const char *iw = getenv("PRSP_INLINE_WORDS"))
 		vu_inline_words = unsigned(atoi(iw));
 	init_vu_stubs();
@@ -1319,6 +1323,27 @@ int CPU::enter(uint32_t pc)
 	return ret;
 }
 
+void CPU::jit_goto_pc(jit_state_t *_jit)
+{
+#ifdef PRSP_VU_FAST
+	if (vu_fast_enabled && inline_dispatch_enabled)
+	{
+		// The same sequence as the enter thunk (init_jit_thunks); everything but the state and dmem registers is free here.
+		jit_andi(JIT_R2, JIT_REGISTER_NEXT_PC, (IMEM_SIZE - 1) & ~3u);
+		jit_lshi(JIT_R2, JIT_R2, 1);
+		jit_addr(JIT_R2, JIT_R2, JIT_REGISTER_STATE);
+		jit_ldxi(JIT_R2, JIT_R2, offsetof(CPU, blocks));
+		jit_node_t *miss = jit_beqi(JIT_R2, 0);
+		jit_movr(JIT_REGISTER_NEXT_PC, JIT_R2);
+		jit_clear_illegal_cond_branch_taken(_jit, JIT_REGISTER_MODE);
+		jit_stxi_i(offsetof(CPUState, sr) + RegisterCache::COND_BRANCH_TAKEN * 4, JIT_REGISTER_STATE, JIT_REGISTER_MODE);
+		jit_jmpr(JIT_REGISTER_NEXT_PC);
+		jit_patch(miss);
+	}
+#endif
+	jit_patch_abs(jit_jmpi(), thunks.enter_thunk);
+}
+
 void CPU::jit_end_of_block(jit_state_t *_jit, uint32_t pc, const CPU::InstructionInfo &last_info)
 {
 	// If we run off the end of a block with a pending delay slot, we need to move it to CPUState.
@@ -1352,7 +1377,7 @@ void CPU::jit_end_of_block(jit_state_t *_jit, uint32_t pc, const CPU::Instructio
 	if (forward)
 		jit_patch(forward);
 	jit_movi(JIT_REGISTER_NEXT_PC, pc);
-	jit_patch_abs(jit_jmpi(), thunks.enter_thunk);
+	jit_goto_pc(_jit);
 }
 
 void CPU::jit_handle_impossible_delay_slot(jit_state_t *_jit, const InstructionInfo &info,
@@ -1467,7 +1492,7 @@ void CPU::jit_handle_delay_slot(jit_state_t *_jit, const InstructionInfo &last_i
 				jit_load_indirect_register(_jit, JIT_REGISTER_NEXT_PC);
 			else
 				jit_movi(JIT_REGISTER_NEXT_PC, last_info.branch_target);
-			jit_patch_abs(jit_jmpi(), thunks.enter_thunk);
+			jit_goto_pc(_jit);
 			jit_patch(no_branch);
 		}
 	}
@@ -1485,7 +1510,7 @@ void CPU::jit_handle_delay_slot(jit_state_t *_jit, const InstructionInfo &last_i
 				jit_load_indirect_register(_jit, JIT_REGISTER_NEXT_PC);
 			else
 				jit_movi(JIT_REGISTER_NEXT_PC, last_info.branch_target);
-			jit_patch_abs(jit_jmpi(), thunks.enter_thunk);
+			jit_goto_pc(_jit);
 		}
 	}
 }

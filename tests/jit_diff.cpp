@@ -3,7 +3,7 @@
 // and compares the complete architectural state (scalar registers, vector registers, accumulator, flags, divide state, DMEM,
 // PC and delay slot state) after every program.
 //
-//   jit_diff [programs] [seed] [mode]      mode: all (default) | single | random | vu | div | scalar
+//   jit_diff [programs] [seed] [mode]      mode: all (default) | single | random | vu | div | scalar | link
 //
 // Mode `scalar` is different: it does not compare the two JITs with each other but each of them with a small C++ model of the scalar
 // load/store instructions (LB LBU LH LHU LW LWU SB SH SW) and the ALU forms used to build addresses, so a code generation change that
@@ -357,6 +357,68 @@ static uint32_t rnd_cop0()
 
 static const uint32_t BREAK = 0x0000000d;
 
+// Programs of several segments far enough apart to be separate JIT regions, joined by j / jal / jr / conditional branches, so that the
+// code that leaves a region (the block lookup, the enter thunk) runs. The segments are visited in increasing order: no loops.
+static void gen_link_program(uint32_t *imem)
+{
+	const unsigned SEG = 160, NSEG = 5;
+	for (unsigned i = 0; i < 1024; i++)
+		imem[i] = 0;
+	for (unsigned k = 0; k < NSEG; k++)
+	{
+		unsigned at = k * SEG, len = 12 + rnd() % 14; // entered at +0..+8: never in the terminal sequence
+		for (unsigned i = 0; i < len; i++)
+		{
+			unsigned r = rnd() % 100;
+			if (r < 30) imem[at + i] = rnd_vu();
+			else if (r < 45) imem[at + i] = rnd_lwc2(false);
+			else if (r < 55) imem[at + i] = rnd_lwc2(true);
+			else imem[at + i] = rnd_scalar();
+		}
+		unsigned t = at + len + 4; // after some padding (a short forward branch may land in it)
+		unsigned next = (k + 1) * SEG + (rnd() % 3) * 4;
+		if (k == NSEG - 1)
+		{
+			imem[t] = BREAK;
+			continue;
+		}
+		unsigned rr = 1 + rnd() % 30;
+		switch (rnd() % 5)
+		{
+		case 0: // j next ; delay slot
+			imem[t] = (002u << 26) | next;
+			imem[t + 1] = rnd_scalar() & ~(077u << 26) | (015u << 26); // ori in the delay slot
+			break;
+		case 1: // jal next
+			imem[t] = (003u << 26) | next;
+			imem[t + 1] = 0;
+			break;
+		case 2: // lui / ori the target, jr
+			imem[t] = (015u << 26) | (0u << 21) | (rr << 16) | ((next << 2) & 0xffff);
+			imem[t + 1] = (000u << 26) | (rr << 21) | 010;
+			imem[t + 2] = rnd_scalar() & ~(077u << 26) | (015u << 26);
+			break;
+		case 3: // beq r0, r0 next (always taken), then the fall-through goes on to the next-but-one segment
+			imem[t] = (004u << 26) | (next - (t + 1));
+			imem[t + 1] = 0;
+			imem[t + 2] = (002u << 26) | (next + 4);
+			break;
+		default: // bne rs, rt: taken or not, then j to the next segment
+			imem[t] = (005u << 26) | ((rnd() % 32) << 21) | ((rnd() % 32) << 16) | ((next + 8 - (t + 1)) & 0xffff);
+			imem[t + 1] = 0;
+			imem[t + 2] = (002u << 26) | next;
+			imem[t + 3] = 0;
+			break;
+		}
+		// the last segment may be entered at +0..+8 words: make sure there is something there
+		if (k + 1 == NSEG - 1)
+			for (unsigned i = 0; i < 12; i++)
+				if (!imem[(k + 1) * SEG + i])
+					imem[(k + 1) * SEG + i] = BREAK;
+	}
+	imem[NSEG * SEG - 1] = BREAK;
+}
+
 // ---- reciprocal / reciprocal square root (VRCP, VRCPL, VRCPH, VRSQ, VRSQL, VRSQH) and CFC2 / CTC2 ----
 enum { VRCP = 060, VRCPL = 061, VRCPH = 062, VMOV = 063, VRSQ = 064, VRSQL = 065, VRSQH = 066 };
 
@@ -452,7 +514,17 @@ int main(int argc, char **argv)
 	auto run_one = [&](const char *what) {
 		copy_state(*fast, *init, dmem0, imem0);
 		copy_state(*slow, *init, dmem0, imem0);
+		if (getenv("JD_TRACE"))
+		{
+			fprintf(stderr, "run %u (%s):", runs + 1, what);
+			for (unsigned i = 0; i < 1024; i++)
+				if (imem0[i])
+					fprintf(stderr, " %u:%08x", i, imem0[i]);
+			fprintf(stderr, "\n");
+		}
 		auto m1 = slow->cpu.run();
+		if (getenv("JD_TRACE"))
+			fprintf(stderr, "  slow done\n");
 		auto m2 = fast->cpu.run();
 		runs++;
 		std::string why;
@@ -585,6 +657,16 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (mode == "all" || mode == "link")
+	{
+		for (unsigned p = 0; p < programs; p++)
+		{
+			randomize_state(*init, dmem0);
+			gen_link_program(imem0);
+			run_one("link");
+			run_one("link, regions already compiled"); // the same IMEM: every region exit now finds its block in blocks[]
+		}
+	}
 	if (mode == "prog")
 	{
 		// Replays one scalar program given in $JD_PROG (hex words) with the registers of $JD_REGS (31 hex words, default 0) through the
