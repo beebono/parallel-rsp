@@ -3,7 +3,11 @@
 // and compares the complete architectural state (scalar registers, vector registers, accumulator, flags, divide state, DMEM,
 // PC and delay slot state) after every program.
 //
-//   jit_diff [programs] [seed] [mode]      mode: all (default) | single | random | vu | div
+//   jit_diff [programs] [seed] [mode]      mode: all (default) | single | random | vu | div | scalar
+//
+// Mode `scalar` is different: it does not compare the two JITs with each other but each of them with a small C++ model of the scalar
+// load/store instructions (LB LBU LH LHU LW LWU SB SH SW) and the ALU forms used to build addresses, so a code generation change that
+// both JITs share (the Lightning backend, the addressing sequence) is caught as well.
 #include "rsp_jit.hpp"
 #include <new>
 #include <random>
@@ -113,6 +117,116 @@ static bool compare_state(const CPUState &a, const CPUState &b, const uint32_t *
 }
 
 static std::mt19937 rnd;
+
+
+// ---- scalar load/store model (mode `scalar`) ----
+struct ScalarModel
+{
+	uint32_t r[32];
+	uint32_t dmem[1024];
+
+	uint32_t get8(uint32_t a) const { a &= 0xfff; return (dmem[a >> 2] >> (24 - 8 * (a & 3))) & 0xff; }
+	void put8(uint32_t a, uint32_t v)
+	{
+		a &= 0xfff;
+		unsigned sh = 24 - 8 * (a & 3);
+		dmem[a >> 2] = (dmem[a >> 2] & ~(0xffu << sh)) | ((v & 0xff) << sh);
+	}
+	void set(unsigned i, uint32_t v) { if (i) r[i] = v; }
+
+	// Runs until BREAK.
+	void run(const uint32_t *imem)
+	{
+		for (unsigned pc = 0; pc < 1024; pc++)
+		{
+			uint32_t in = imem[pc];
+			uint32_t op = in >> 26, rs = (in >> 21) & 31, rt = (in >> 16) & 31, rd = (in >> 11) & 31, sh = (in >> 6) & 31;
+			int32_t simm = int16_t(in);
+			uint32_t uimm = in & 0xffff;
+			uint32_t a = (r[rs] + uint32_t(simm)) & 0xfff;
+			switch (op)
+			{
+			case 000:
+				switch (in & 63)
+				{
+				case 000: set(rd, r[rt] << sh); break;
+				case 002: set(rd, r[rt] >> sh); break;
+				case 015: return;
+				case 041: set(rd, r[rs] + r[rt]); break;
+				case 043: set(rd, r[rs] - r[rt]); break;
+				case 045: set(rd, r[rs] | r[rt]); break;
+				}
+				break;
+			case 010: case 011: set(rt, r[rs] + uint32_t(simm)); break;
+			case 014: set(rt, r[rs] & uimm); break;
+			case 015: set(rt, r[rs] | uimm); break;
+			case 017: set(rt, uimm << 16); break;
+			case 040: set(rt, uint32_t(int32_t(int8_t(get8(a))))); break;
+			case 044: set(rt, get8(a)); break;
+			case 041: set(rt, uint32_t(int32_t(int16_t((get8(a) << 8) | get8(a + 1))))); break;
+			case 045: set(rt, (get8(a) << 8) | get8(a + 1)); break;
+			case 043: case 047: set(rt, (get8(a) << 24) | (get8(a + 1) << 16) | (get8(a + 2) << 8) | get8(a + 3)); break;
+			case 050: put8(a, r[rt]); break;
+			case 051: put8(a, r[rt] >> 8); put8(a + 1, r[rt]); break;
+			case 053: put8(a, r[rt] >> 24); put8(a + 1, r[rt] >> 16); put8(a + 2, r[rt] >> 8); put8(a + 3, r[rt]); break;
+			}
+		}
+	}
+};
+
+// A program of address arithmetic and loads/stores. Registers 1..9 form a small pool so that results feed later addresses and
+// stored values; constants near the end of DMEM (the 4 KB wrap) and bases of $0 are common.
+static void gen_scalar_program(uint32_t *imem, unsigned len)
+{
+	for (unsigned i = 0; i < 1024; i++)
+		imem[i] = 0;
+	auto pool = [] { return 1 + rnd() % 9; };
+	for (unsigned i = 0; i < len; i++)
+	{
+		unsigned k = rnd() % 100, rs = pool(), rt = pool(), rd = pool();
+		if (rnd() % 5 == 0)
+			rs = 0;
+		uint32_t imm;
+		switch (rnd() % 6)
+		{
+		case 0: imm = rnd() & 15; break;
+		case 1: imm = 0xfff0u + (rnd() & 15); break;
+		case 2: imm = (0u - (rnd() & 15)) & 0xffff; break;
+		case 3: imm = rnd() & 0xfff; break;
+		case 4: imm = (rnd() & 0xff) << 2; break;
+		default: imm = rnd() & 0xffff; break;
+		}
+		if (k < 14) // build a constant
+		{
+			imem[i] = (017u << 26) | (rt << 16) | ((rnd() & 3) ? 0 : (rnd() & 0xffff));
+		}
+		else if (k < 26)
+			imem[i] = (015u << 26) | (rs << 21) | (rt << 16) | imm;
+		else if (k < 34)
+			imem[i] = (((rnd() & 1) ? 011u : 010u) << 26) | (rs << 21) | (rt << 16) | imm;
+		else if (k < 38)
+			imem[i] = (014u << 26) | (rs << 21) | (rt << 16) | (imm | 0xf000);
+		else if (k < 42)
+		{
+			static const unsigned f[] = { 041, 043, 045 };
+			imem[i] = (rs << 21) | (pool() << 16) | (rd << 11) | f[rnd() % 3];
+		}
+		else if (k < 45)
+			imem[i] = (pool() << 16) | (rd << 11) | ((rnd() % 32) << 6) | ((rnd() & 1) ? 0 : 2);
+		else if (k < 75)
+		{
+			static const unsigned t[] = { 040, 041, 043, 044, 045, 047 };
+			imem[i] = (t[rnd() % 6] << 26) | (rs << 21) | (rt << 16) | imm;
+		}
+		else
+		{
+			static const unsigned t[] = { 050, 051, 053 };
+			imem[i] = (t[rnd() % 3] << 26) | (rs << 21) | (rt << 16) | imm;
+		}
+	}
+	for (unsigned i = 0; i < 8; i++)
+		imem[len + i] = 0x0000000d;
+}
 
 static uint32_t rnd_flag_vec_word()
 {
@@ -467,6 +581,47 @@ int main(int argc, char **argv)
 			randomize_state(*init, dmem0);
 			gen_program(imem0, 8 + rnd() % 120, 0);
 			run_one("random");
+		}
+	}
+
+	if (mode == "all" || mode == "scalar")
+	{
+		// Both JITs against the C++ model: scalar registers and DMEM after loads, stores and address arithmetic.
+		static ScalarModel model;
+		for (unsigned p = 0; p < programs; p++)
+		{
+			randomize_state(*init, dmem0);
+			gen_scalar_program(imem0, 4 + rnd() % 60);
+			model.r[0] = 0;
+			for (int i = 1; i < 32; i++)
+				model.r[i] = init->sr[i];
+			memcpy(model.dmem, dmem0, sizeof(model.dmem));
+			model.run(imem0);
+			for (int variant = 0; variant < 2; variant++)
+			{
+				Machine &m = variant ? *fast : *slow;
+				copy_state(m, *init, dmem0, imem0);
+				m.cpu.run();
+				runs++;
+				const char *why = nullptr;
+				int bad = -1;
+				for (int i = 0; i < 32 && !why; i++)
+					if (m.cpu.get_state().sr[i] != model.r[i])
+						why = "register", bad = i;
+				if (!why && memcmp(m.dmem, model.dmem, 4096))
+					why = "dmem";
+				if (why)
+				{
+					failures++;
+					if (failures < 20)
+					{
+						fprintf(stderr, "MISMATCH (scalar, %s JIT) run %u: %s %d\n  program:", variant ? "fast" : "slow", runs, why, bad);
+						for (unsigned i = 0; i < 1024 && imem0[i] != BREAK; i++)
+							fprintf(stderr, " %08x", imem0[i]);
+						fprintf(stderr, "\n");
+					}
+				}
+			}
 		}
 	}
 #ifdef PRSP_LS_COUNT
