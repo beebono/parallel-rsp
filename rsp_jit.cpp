@@ -1573,6 +1573,21 @@ void CPU::jit_emit_store_operation(jit_state_t *_jit,
 #ifdef PRSP_VU_FAST
 	if (vu_fast_enabled)
 	{
+		const unsigned static_addr = unsigned(int(simm)) & 0xfffu;
+		if (rs == 0 && !(static_addr & align_mask))
+		{
+			const unsigned off = static_addr ^ endian_flip;
+			unsigned rt_reg = regs.load_mips_register_noext(_jit, rt);
+			switch (instr >> 26)
+			{
+			case 050: jit_stxi_c(off, JIT_REGISTER_DMEM, rt_reg); break;
+			case 051: jit_stxi_s(off, JIT_REGISTER_DMEM, rt_reg); break;
+			default: jit_stxi_i(off, JIT_REGISTER_DMEM, rt_reg); break; // SW
+			}
+			regs.unlock_mips_register(rt);
+			return;
+		}
+
 		unsigned rt_reg = regs.load_mips_register_noext(_jit, rt);
 		unsigned rs_reg = regs.load_mips_register_noext(_jit, rs);
 		unsigned addr = regs.modify_mips_register(_jit, RegisterCache::SCRATCH_REGISTER0);
@@ -1672,6 +1687,24 @@ void CPU::jit_emit_load_operation(jit_state_t *_jit,
 #ifdef PRSP_VU_FAST
 	if (vu_fast_enabled)
 	{
+		// $0 base: the address and its alignment are known now. One load with an immediate offset.
+		const unsigned static_addr = unsigned(int(simm)) & 0xfffu;
+		if (rs == 0 && !(static_addr & align_mask))
+		{
+			const unsigned off = static_addr ^ endian_flip;
+			unsigned rt_reg = regs.modify_mips_register(_jit, rt);
+			switch (instr >> 26)
+			{
+			case 040: jit_ldxi_c(rt_reg, JIT_REGISTER_DMEM, off); break;
+			case 041: jit_ldxi_s(rt_reg, JIT_REGISTER_DMEM, off); break;
+			case 044: jit_ldxi_uc(rt_reg, JIT_REGISTER_DMEM, off); break;
+			case 045: jit_ldxi_us(rt_reg, JIT_REGISTER_DMEM, off); break;
+			default: jit_ldxi_i(rt_reg, JIT_REGISTER_DMEM, off); break; // LW, LWU
+			}
+			regs.unlock_mips_register(rt);
+			return;
+		}
+
 		unsigned rs_reg = regs.load_mips_register_noext(_jit, rs);
 		unsigned addr = regs.modify_mips_register(_jit, RegisterCache::SCRATCH_REGISTER0);
 		jit_addi(addr, rs_reg, simm);

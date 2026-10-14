@@ -585,6 +585,50 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (mode == "prog")
+	{
+		// Replays one scalar program given in $JD_PROG (hex words) with the registers of $JD_REGS (31 hex words, default 0) through the
+		// fast JIT and the model; PRSP_DUMP_JIT=file keeps the generated code.
+		static ScalarModel model;
+		randomize_state(*init, dmem0);
+		memset(imem0, 0, sizeof(imem0));
+		unsigned n = 0;
+		for (const char *p = getenv("JD_PROG"); p && *p && n < 1000;)
+		{
+			char *e;
+			imem0[n++] = strtoul(p, &e, 16);
+			p = e;
+		}
+		for (unsigned i = 0; i < 8; i++)
+			imem0[n + i] = BREAK;
+		const char *rp = getenv("JD_REGS");
+		for (int i = 1; i < 32; i++)
+		{
+			char *e = nullptr;
+			init->sr[i] = rp ? strtoul(rp, &e, 16) : 0;
+			if (rp)
+				rp = e;
+		}
+		model.r[0] = 0;
+		for (int i = 1; i < 32; i++)
+			model.r[i] = init->sr[i];
+		memcpy(model.dmem, dmem0, sizeof(model.dmem));
+		model.run(imem0);
+		copy_state(*fast, *init, dmem0, imem0);
+		fast->cpu.run();
+		runs++;
+		for (int i = 0; i < 32; i++)
+			if (fast->cpu.get_state().sr[i] != model.r[i])
+			{
+				failures++;
+				fprintf(stderr, "r%d: jit %08x model %08x\n", i, fast->cpu.get_state().sr[i], model.r[i]);
+			}
+		if (memcmp(fast->dmem, model.dmem, 4096))
+		{
+			failures++;
+			fprintf(stderr, "dmem differs\n");
+		}
+	}
 	if (mode == "all" || mode == "scalar")
 	{
 		// Both JITs against the C++ model: scalar registers and DMEM after loads, stores and address arithmetic.
@@ -616,10 +660,43 @@ int main(int argc, char **argv)
 					failures++;
 					if (failures < 20)
 					{
-						fprintf(stderr, "MISMATCH (scalar, %s JIT) run %u: %s %d\n  program:", variant ? "fast" : "slow", runs, why, bad);
-						for (unsigned i = 0; i < 1024 && imem0[i] != BREAK; i++)
-							fprintf(stderr, " %08x", imem0[i]);
+						// Shortest failing prefix.
+						uint32_t full[1024];
+						memcpy(full, imem0, sizeof(full));
+						unsigned n = 0;
+						while (n < 1024 && full[n] != BREAK)
+							n++;
+						unsigned shortest = n;
+						for (unsigned len = 1; len <= n; len++)
+						{
+							memcpy(imem0, full, sizeof(full));
+							for (unsigned i = 0; i < 8; i++)
+								imem0[len + i] = BREAK;
+							static ScalarModel m2;
+							for (int i = 0; i < 32; i++)
+								m2.r[i] = i ? init->sr[i] : 0;
+							memcpy(m2.dmem, dmem0, sizeof(m2.dmem));
+							m2.run(imem0);
+							copy_state(m, *init, dmem0, imem0);
+							m.cpu.run();
+							bool differs = memcmp(m.dmem, m2.dmem, 4096) != 0;
+							for (int i = 0; i < 32; i++)
+								differs |= m.cpu.get_state().sr[i] != m2.r[i];
+							if (differs)
+							{
+								shortest = len;
+								break;
+							}
+						}
+						fprintf(stderr, "MISMATCH (scalar, %s JIT) run %u: %s %d\n  shortest failing program (%u of %u instructions):", variant ? "fast" : "slow",
+						        runs, why, bad, shortest, n);
+						for (unsigned i = 0; i < shortest; i++)
+							fprintf(stderr, " %08x", full[i]);
+						fprintf(stderr, "\n  initial registers:");
+						for (int i = 1; i < 32; i++)
+							fprintf(stderr, " %08x", init->sr[i]);
 						fprintf(stderr, "\n");
+						memcpy(imem0, full, sizeof(full));
 					}
 				}
 			}
