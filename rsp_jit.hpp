@@ -55,6 +55,9 @@ public:
 	// Before leaving a JIT block, or before branching, we must flush out all live registers.
 	void flush_register_window(jit_state_t *_jit);
 
+	// Write back the modified registers but keep every entry live (now clean): the code that follows is reached only by falling through.
+	void writeback_modified_registers(jit_state_t *_jit);
+
 	// Similar, but we only need to invalidate caller save registers (JIT_R).
 	void flush_caller_save_registers(jit_state_t *_jit);
 
@@ -275,7 +278,8 @@ private:
 	void jit_exit_dynamic(jit_state_t *_jit, uint32_t pc, const InstructionInfo &last_info, bool first_instruction);
 	void jit_end_of_block(jit_state_t *_jit, uint32_t pc, const InstructionInfo &last_info);
 
-	void jit_handle_delay_slot(jit_state_t *_jit, const InstructionInfo &last_info, uint32_t base_pc, uint32_t end_pc);
+	void jit_handle_delay_slot(jit_state_t *_jit, const InstructionInfo &last_info, uint32_t base_pc, uint32_t end_pc,
+	                           bool keep_cache);
 	void jit_handle_impossible_delay_slot(jit_state_t *_jit, const InstructionInfo &info, const InstructionInfo &last_info,
 	                                      uint32_t base_pc, uint32_t end_pc);
 	void jit_handle_latent_delay_slot(jit_state_t *_jit, const InstructionInfo &last_info);

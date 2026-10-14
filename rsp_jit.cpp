@@ -1421,7 +1421,7 @@ void CPU::jit_handle_impossible_delay_slot(jit_state_t *_jit, const InstructionI
 }
 
 void CPU::jit_handle_delay_slot(jit_state_t *_jit, const InstructionInfo &last_info,
-                                uint32_t base_pc, uint32_t end_pc)
+                                uint32_t base_pc, uint32_t end_pc, bool keep_cache)
 {
 	unsigned scratch_cond_reg = 0;
 	if (last_info.conditional)
@@ -1445,7 +1445,12 @@ void CPU::jit_handle_delay_slot(jit_state_t *_jit, const InstructionInfo &last_i
 		jit_movi(cond_branch_reg, 0);
 		regs.unlock_mips_register(RegisterCache::COND_BRANCH_TAKEN);
 	}
-	regs.flush_register_window(_jit);
+	// The taken path needs memory up to date and an empty cache (it enters a block entry or leaves the region). The not-taken path
+	// keeps the registers if the next instruction cannot be reached any other way.
+	if (keep_cache)
+		regs.writeback_modified_registers(_jit);
+	else
+		regs.flush_register_window(_jit);
 
 	if (last_info.conditional)
 	{
@@ -3002,7 +3007,13 @@ Func CPU::jit_region(uint64_t hash, unsigned pc_word, unsigned instruction_count
 		else if (!inst_info.handles_delay_slot && last_info.branch)
 		{
 			// Normal handling of the delay slot.
-			jit_handle_delay_slot(_jit, last_info, pc_word << 2, (pc_word + instruction_count) << 2);
+			jit_handle_delay_slot(_jit, last_info, pc_word << 2, (pc_word + instruction_count) << 2,
+#ifdef PRSP_VU_FAST
+			                      vu_fast_enabled && last_info.conditional && i + 1 < instruction_count && !block_entry[i + 1]
+#else
+			                      false
+#endif
+			                      );
 		}
 		last_info = inst_info;
 	}
@@ -3654,6 +3665,19 @@ void RegisterCache::flush_register_window(jit_state_t *_jit)
 		}
 	}
 	timestamp = 0;
+}
+
+void RegisterCache::writeback_modified_registers(jit_state_t *_jit)
+{
+	for (auto &entry : entries)
+	{
+		if (entry.is_live)
+		{
+			assert(!entry.num_locks);
+			if (entry.modified)
+				writeback_register(_jit, entry);
+		}
+	}
 }
 
 void RegisterCache::flush_caller_save_registers(jit_state_t *_jit)
