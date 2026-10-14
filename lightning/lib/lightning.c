@@ -3703,6 +3703,14 @@ _simplify(jit_state_t *_jit)
 		    result = 1;
 		    simplify_spill(node = prev, regno);
 		}
+#else
+		/* The load still overwrites its destination: forget the value
+		 * a previous movi/movr left there, or a later movi of the same
+		 * constant is deleted as redundant (movi r, 0; ldxi r, ...;
+		 * movi r, 0 lost the second movi). */
+		regno = jit_regno(node->u.w);
+		_jitc->values[regno].kind = 0;
+		++_jitc->gen[regno];
 #endif
 		break;
 	    case jit_code_stxi_c:	case jit_code_stxi_s:
