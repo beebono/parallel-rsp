@@ -43,6 +43,8 @@ static uint64_t prsp_prof_slow_detail[2][12][16][16]; // [store][op][e][addr & 1
 static uint64_t prsp_prof_run_vu[64], prsp_prof_run_vl[64], prsp_prof_enter;
 static unsigned prsp_prof_cur_vu, prsp_prof_cur_vl;
 static uint64_t prsp_prof_total;
+static uint64_t prsp_prof_unaligned[5]; // unaligned scalar LH, LW, LHU, SH, SW (the helper calls)
+#define PRSP_PROF_UNALIGNED(i) (prsp_prof_unaligned[i]++)
 static void prsp_prof_dump()
 {
 	const char *f = getenv("PRSP_PROF_OUT");
@@ -53,6 +55,7 @@ static void prsp_prof_dump()
 	for (unsigned i = 0; i < 2048; i++) if (prsp_prof_cnt[i]) fprintf(o, "op %u %llu\n", i, (unsigned long long)prsp_prof_cnt[i]);
 	for (unsigned a = 0; a < 2; a++) for (unsigned b = 0; b < 12; b++) for (unsigned c = 0; c < 16; c++) for (unsigned d = 0; d < 16; d++)
 		if (prsp_prof_slow_detail[a][b][c][d]) fprintf(o, "slow %u %u %u %u %llu\n", a, b, c, d, (unsigned long long)prsp_prof_slow_detail[a][b][c][d]);
+	for (unsigned i = 0; i < 5; i++) if (prsp_prof_unaligned[i]) fprintf(o, "unaligned %u %llu\n", i, (unsigned long long)prsp_prof_unaligned[i]);
 	for (unsigned i = 0; i < 64; i++) if (prsp_prof_run_vu[i]) fprintf(o, "runvu %u %llu\n", i, (unsigned long long)prsp_prof_run_vu[i]);
 	for (unsigned i = 0; i < 64; i++) if (prsp_prof_run_vl[i]) fprintf(o, "runvl %u %llu\n", i, (unsigned long long)prsp_prof_run_vl[i]);
 	fclose(o);
@@ -70,6 +73,8 @@ extern "C" void prsp_prof_hit(unsigned id PRSP_HOOK_HIT_PARAM)
 	if (vu || ls) prsp_prof_cur_vl++; else { if (prsp_prof_cur_vl) prsp_prof_run_vl[prsp_prof_cur_vl > 63 ? 63 : prsp_prof_cur_vl]++; prsp_prof_cur_vl = 0; }
 	if ((++prsp_prof_total & ((1u << 24) - 1)) == 0) prsp_prof_dump();
 }
+#else
+#define PRSP_PROF_UNALIGNED(i) ((void)0)
 #endif
 
 // Debugging aid: PRSP_DUMP_JIT=<file> writes an image of the code region (file offset = address - first code address) for use with
@@ -343,6 +348,7 @@ extern "C"
 
 	static jit_word_t rsp_unaligned_lh(const uint8_t *dram, jit_word_t addr)
 	{
+		PRSP_PROF_UNALIGNED(0);
 		auto off0 = BYTE_ENDIAN_FIXUP(addr, 0);
 		auto off1 = BYTE_ENDIAN_FIXUP(addr, 1);
 		return jit_word_t(int16_t((dram[off0] << 8) |
@@ -351,6 +357,7 @@ extern "C"
 
 	static jit_word_t rsp_unaligned_lw(const uint8_t *dram, jit_word_t addr)
 	{
+		PRSP_PROF_UNALIGNED(1);
 		auto off0 = BYTE_ENDIAN_FIXUP(addr, 0);
 		auto off1 = BYTE_ENDIAN_FIXUP(addr, 1);
 		auto off2 = BYTE_ENDIAN_FIXUP(addr, 2);
@@ -365,6 +372,7 @@ extern "C"
 
 	static jit_uword_t rsp_unaligned_lhu(const uint8_t *dram, jit_word_t addr)
 	{
+		PRSP_PROF_UNALIGNED(2);
 		auto off0 = BYTE_ENDIAN_FIXUP(addr, 0);
 		auto off1 = BYTE_ENDIAN_FIXUP(addr, 1);
 		return jit_word_t(uint16_t((dram[off0] << 8) |
@@ -373,6 +381,7 @@ extern "C"
 
 	static void rsp_unaligned_sh(uint8_t *dram, jit_word_t addr, jit_word_t data)
 	{
+		PRSP_PROF_UNALIGNED(3);
 		auto off0 = BYTE_ENDIAN_FIXUP(addr, 0);
 		auto off1 = BYTE_ENDIAN_FIXUP(addr, 1);
 		dram[off0] = (data >> 8) & 0xff;
@@ -381,6 +390,7 @@ extern "C"
 
 	static void rsp_unaligned_sw(uint8_t *dram, jit_word_t addr, jit_word_t data)
 	{
+		PRSP_PROF_UNALIGNED(4);
 		auto off0 = BYTE_ENDIAN_FIXUP(addr, 0);
 		auto off1 = BYTE_ENDIAN_FIXUP(addr, 1);
 		auto off2 = BYTE_ENDIAN_FIXUP(addr, 2);
