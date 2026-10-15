@@ -240,3 +240,34 @@ Emulation-thread CPU time per frame moves by the same absolute amount (Banjo-Kaz
 - unaligned scalar helper calls per 1100 frames: SM64 LW 97.8k, SW 97.8k, LHU 15k; OoT LW 312k, LHU 39k, SW 31k; Banjo-Kazooie LHU 51k only (0.2 %, 0.4 %, 2.2 % and 0.2 % of the scalar loads/stores);
 - no task in the eight scenes reaches the 32767 `SP_STATUS` polls of the initial time-out (largest COP0 count of a task: 69k in DK64 over all COP0 instructions), so the first poll-out
   burning one task per session was not observed and the initial limit is unchanged.
+
+## Inline region exits (`0b9dd6f`) on the rg35xxsp, A/B (2026-10-15)
+
+Question: keep the inline `blocks[]` lookup at region exits? A = default, B = `PRSP_NO_INLINE_DISPATCH=1`, same plugin binary (arMLEt `--prof` build, fork `m64p-aarch64` at the
+parent's pinned commit, glibc 2.17 toolchain build), rg35xxsp (H700, 4x Cortex-A53), `cpu_perf.sh on` (1512 MHz) and restored afterwards, `tools/session/host.sh`, one
+session per game: 3 alternating pairs (A B, B A, A B), scripted pad input, VI frames 1440-2160, rsp-hle audio + parallel-rsp graphics + foir (3 workers).
+JIT proper = profiler level 1 (`report_time.py` definition: JIT code, helpers, SP DMA, block lookup; without the video plugin's callback). RSP = the shim's RSP time per frame
+(includes the callback); emu = emulation-thread CPU time per frame. Values are the mean of 3 runs, (range of the 3 runs); delta = A vs B, negative = inline faster.
+
+| game | JIT proper A ms | JIT proper B ms | delta | RSP delta | emu delta |
+|---|---|---|---|---|---|
+| Banjo-Kazooie | 4.300 (0.041) | 4.319 (0.029) | -0.4 % | -0.5 % | -0.3 % |
+| Donkey Kong 64 | 3.485 (0.024) | 3.502 (0.043) | -0.5 % | +0.1 % | +0.1 % |
+| Ocarina of Time | 1.398 (0.028) | 1.412 (0.018) | -1.0 % | +1.8 % | +0.9 % |
+| Mario Kart 64 | 0.436 (0.009) | 0.439 (0.012) | -0.5 % | -0.4 % | -0.4 % |
+| Paper Mario | 2.508 (0.020) | 2.500 (0.019) | +0.3 % | +0.7 % | +0.3 % |
+| Pokemon Snap | 0.151 (0.004) | 0.157 (0.006) | -3.4 % | +1.1 % | +0.8 % |
+| Star Fox 64 | 2.001 (0.019) | 2.012 (0.010) | -0.5 % | +0.2 % | +0.4 % |
+| Super Mario 64 | 3.103 (0.041) | 3.120 (0.009) | -0.5 % | -0.4 % | -0.1 % |
+| Toy Story 2 | 0.443 (0.044) | 0.422 (0.041) | +5.0 % | -0.1 % | 0.0 % |
+
+The run-to-run range is 0.5-1.5 % of the JIT proper (up to 10 % in the two tiny cases, Snap and Toy Story 2, at 0.15 and 0.43 ms), 1-3 % of the RSP time. Every JIT-proper
+difference is inside or at the edge of that range; the sign is A faster in 7 of 9 games, by 0.4-1.0 % (0.01-0.02 ms) in the six substantial ones. RSP and emu-thread
+times, which add the callback and its worker-thread noise, scatter around zero (-0.5 % .. +1.8 %). No frame-rate effect (the games run at the VI rate).
+
+Equivalence (plain arMLEt build, `RSPT_HASH`, screenshots at frames 400 and 1000, A vs B): the per-call RSP state hash stream (484 / 966 / 1451 / 1934 lines) and the
+screenshots are identical in Banjo-Kazooie, Super Mario 64, Ocarina of Time and Paper Mario.
+
+Verdict: on the A53 the inline lookup is neutral to marginally positive (about -0.5 % of the JIT proper, 0.01-0.02 ms per frame), the opposite sign from the Banjo-Kazooie
++0.6 % on the A55 (rgdsplus). Neither device shows an effect beyond the noise, so the change is not worth a revert on speed grounds; it adds code (exits 2 -> about 11
+instructions) for no measurable gain. Raw data: `test-output/session/rg35xxsp/I.*` and `eq` (not tracked).
