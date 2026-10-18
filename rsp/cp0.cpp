@@ -11,6 +11,9 @@ namespace RSP
 extern RSP_INFO rsp;
 extern short MFC0_count[32];
 extern int SP_STATUS_TIMEOUT;
+extern int POLL_IDLE_LIMIT, poll_idle;
+extern bool poll_idle_cut;
+extern uint32_t poll_last_sr[32];
 } // namespace RSP
 #endif
 
@@ -102,6 +105,24 @@ extern "C"
 #ifdef PARALLEL_INTEGRATION
 		if (rd == CP0_REGISTER_SP_STATUS)
 		{
+			// PRSP_POLL_IDLE: a poll with the scalar registers as at the previous poll is the same wait loop again
+			if (RSP::POLL_IDLE_LIMIT > 0)
+			{
+				if (!memcmp(rsp->sr, RSP::poll_last_sr, sizeof(RSP::poll_last_sr)))
+				{
+					if (++RSP::poll_idle >= RSP::POLL_IDLE_LIMIT)
+					{
+						RSP::poll_idle_cut = true;
+						*RSP::rsp.SP_STATUS_REG |= SP_STATUS_HALT;
+						return MODE_CHECK_FLAGS;
+					}
+				}
+				else
+				{
+					RSP::poll_idle = 0;
+					memcpy(RSP::poll_last_sr, rsp->sr, sizeof(RSP::poll_last_sr));
+				}
+			}
 			// Might be waiting for the CPU to set a signal bit on the STATUS register. Increment timeout
 			RSP::MFC0_count[rt] += 1;
 			if (RSP::MFC0_count[rt] >= RSP::SP_STATUS_TIMEOUT)

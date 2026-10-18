@@ -4,6 +4,8 @@
 #include "rsp_jit.hpp"
 #endif
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "m64p_plugin.h"
 #include "rsp_1.1.h"
@@ -28,6 +30,10 @@ RSP::JIT::CPU cpu;
 #endif
 short MFC0_count[32];
 int SP_STATUS_TIMEOUT;
+int POLL_IDLE_LIMIT = -1; // PRSP_POLL_IDLE, read at InitiateRSP
+int poll_idle;
+bool poll_idle_cut;
+uint32_t poll_last_sr[32];
 } // namespace RSP
 
 extern "C"
@@ -57,6 +63,19 @@ extern "C"
 	}
 #endif
 
+	// Idle-poll policy (PRSP_POLL_IDLE=N, N >= 1; default 0 = the original behaviour). The original policy drops the poll time-out from
+	// 0x7fff to 16 for good after the first time-out (run_rsp_task), which keeps a task that waits for the CPU cheap (Gauntlet Legends: a
+	// display list that branches to itself) but cuts every later task, which polls SP_STATUS once per command, into 16-command slices.
+	// With N the time-out stays 0x7fff and a task is cut only when it is idle: N polls in a row with the scalar register file unchanged
+	// since the previous poll (a wait for the CPU runs the same loop with the same registers). A task that makes progress is never cut
+	// by it. A cut is handled like a time-out (the core resumes the task later) but does not lower the limit.
+	void prsp_poll_task_begin(unsigned pc)
+	{
+		(void)pc;
+		RSP::poll_idle = 0;
+		RSP::poll_idle_cut = false;
+	}
+
 	extern "C++"
 	{
 	template <typename CPUType>
@@ -64,6 +83,8 @@ extern "C"
 	{
 		if (*RSP::rsp.SP_STATUS_REG & (SP_STATUS_HALT | SP_STATUS_BROKE))
 			return 0;
+
+		prsp_poll_task_begin(*RSP::rsp.SP_PC_REG & 0xfff);
 
 		// We don't know if Mupen from the outside invalidated our IMEM.
 		cpu.invalidate_imem();
@@ -97,6 +118,8 @@ extern "C"
 		for (auto count : RSP::MFC0_count)
 			if (count >= RSP::SP_STATUS_TIMEOUT)
 				polling_timed_out = true;
+		if (RSP::poll_idle_cut)
+			polling_timed_out = true;
 
 		// From CXD4.
 		if (*RSP::rsp.SP_STATUS_REG & SP_STATUS_BROKE)
@@ -108,7 +131,7 @@ extern "C"
 		else if (*RSP::rsp.SP_SEMAPHORE_REG != 0) // Semaphore lock fixes.
 		{
 		}
-		else
+		else if (RSP::POLL_IDLE_LIMIT <= 0)
 			RSP::SP_STATUS_TIMEOUT = 16; // From now on, wait 16 times, not 0x7fff
 
 		// CPU restarts with the correct SIGs.
@@ -197,6 +220,10 @@ extern "C"
 
 		// From CXD4.
 		RSP::SP_STATUS_TIMEOUT = 0x7fff;
+		{
+			const char *e = getenv("PRSP_POLL_IDLE");
+			RSP::POLL_IDLE_LIMIT = e ? atoi(e) : 0;
+		}
 
 		RSP::cpu.set_dmem(reinterpret_cast<uint32_t *>(Rsp_Info.DMEM));
 		RSP::cpu.set_imem(reinterpret_cast<uint32_t *>(Rsp_Info.IMEM));

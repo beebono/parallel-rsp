@@ -114,6 +114,8 @@ typedef struct PrspNativeSnap
 	uint32_t imem[1024];
 } PrspNativeSnap;
 
+// The poll time-out policy at the start of a task (PRSP_POLL_IDLE=N, see parallel.cpp): resets the idle-poll tracker; the hosts call it before they snapshot the JIT.
+void prsp_poll_task_begin(unsigned pc);
 void prsp_native_install(const PrspNativeHost *host);                 // null: remove (all stubs go)
 void prsp_native_set_pcs(const uint16_t *entries, unsigned n_entries, const uint16_t *splits, unsigned n_splits); // byte pcs; replaces the sets
 void prsp_native_view(PrspNativeView *v);
