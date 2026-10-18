@@ -116,6 +116,18 @@ typedef struct PrspNativeSnap
 
 // The poll time-out policy at the start of a task (PRSP_POLL_IDLE=N, see parallel.cpp): resets the idle-poll tracker; the hosts call it before they snapshot the JIT.
 void prsp_poll_task_begin(unsigned pc);
+// The same policy for a host that runs part of a task (arMLEt, F3DEX2 front-end): limit N (0: off); whether the last SP_STATUS poll was an idle cut; the tracker state
+// (save before a run that may be undone, load to undo it); and the state a cut leaves: sr[32] = the scalar registers at the cut, N idle polls, cut flagged.
+typedef struct PrspPollState
+{
+	uint32_t sr[32];
+	int idle, cut;
+} PrspPollState;
+int prsp_poll_idle_limit(void);
+int prsp_poll_idle_cut(void);
+void prsp_poll_save(PrspPollState *s);
+void prsp_poll_load(const PrspPollState *s);
+void prsp_poll_idle_mark(const uint32_t *sr);
 void prsp_native_install(const PrspNativeHost *host);                 // null: remove (all stubs go)
 void prsp_native_set_pcs(const uint16_t *entries, unsigned n_entries, const uint16_t *splits, unsigned n_splits); // byte pcs; replaces the sets
 void prsp_native_view(PrspNativeView *v);

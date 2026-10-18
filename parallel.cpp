@@ -63,7 +63,7 @@ extern "C"
 	}
 #endif
 
-	// Idle-poll policy (PRSP_POLL_IDLE=N, N >= 1; default 0 = the original behaviour). The original policy drops the poll time-out from
+	// Idle-poll policy (PRSP_POLL_IDLE=N, N >= 1, default 16; 0 = the original behaviour). The original policy drops the poll time-out from
 	// 0x7fff to 16 for good after the first time-out (run_rsp_task), which keeps a task that waits for the CPU cheap (Gauntlet Legends: a
 	// display list that branches to itself) but cuts every later task, which polls SP_STATUS once per command, into 16-command slices.
 	// With N the time-out stays 0x7fff and a task is cut only when it is idle: N polls in a row with the scalar register file unchanged
@@ -222,7 +222,7 @@ extern "C"
 		RSP::SP_STATUS_TIMEOUT = 0x7fff;
 		{
 			const char *e = getenv("PRSP_POLL_IDLE");
-			RSP::POLL_IDLE_LIMIT = e ? atoi(e) : 0;
+			RSP::POLL_IDLE_LIMIT = e ? atoi(e) : 16;
 		}
 
 		RSP::cpu.set_dmem(reinterpret_cast<uint32_t *>(Rsp_Info.DMEM));
@@ -347,6 +347,39 @@ extern "C"
 		const int mode = RSP_MTC0(&s, rd, 32);
 		s.sr[32] = keep;
 		return mode;
+	}
+
+	// For hosts that run part of a task themselves (arMLEt's native front-ends): the policy's limit (0: off), whether the last poll was an idle cut,
+	// the tracker's state (saved and put back when the host's run is undone) and the state a cut leaves (the scalar registers of the cut, N idle polls).
+	int prsp_poll_idle_limit(void)
+	{
+		return RSP::POLL_IDLE_LIMIT > 0 ? RSP::POLL_IDLE_LIMIT : 0;
+	}
+
+	int prsp_poll_idle_cut(void)
+	{
+		return RSP::poll_idle_cut;
+	}
+
+	void prsp_poll_save(PrspPollState *s)
+	{
+		memcpy(s->sr, RSP::poll_last_sr, sizeof(s->sr));
+		s->idle = RSP::poll_idle;
+		s->cut = RSP::poll_idle_cut;
+	}
+
+	void prsp_poll_load(const PrspPollState *s)
+	{
+		memcpy(RSP::poll_last_sr, s->sr, sizeof(s->sr));
+		RSP::poll_idle = s->idle;
+		RSP::poll_idle_cut = s->cut;
+	}
+
+	void prsp_poll_idle_mark(const uint32_t *sr)
+	{
+		memcpy(RSP::poll_last_sr, sr, sizeof(RSP::poll_last_sr));
+		RSP::poll_idle = RSP::POLL_IDLE_LIMIT;
+		RSP::poll_idle_cut = true;
 	}
 
 	uint32_t prsp_native_mfc0(unsigned rd, unsigned rt, int *mode)
