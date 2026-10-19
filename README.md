@@ -100,7 +100,7 @@ The foir plugin's README (section "RSP pairing") has the measured pairings and a
 ## Building
 
 Needs CMake, a C++14 compiler and the Mupen64Plus API headers (`m64p_types.h`, `m64p_plugin.h`); the default location is
-`../mupen64plus-core/src/api`, override with `M64P_API_INCLUDE_DIR=<dir>`.
+`../../../mupen64plus-core-dento/src/api`, override with `M64P_API_INCLUDE_DIR=<dir>`.
 
 ```sh
 ./build_m64p_plugin.sh aarch64   # cross build with aarch64-linux-gnu-g++ -> build-m64p-aarch64/mupen64plus-rsp-parallel.so

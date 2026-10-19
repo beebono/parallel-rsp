@@ -227,7 +227,7 @@ endif()
 #   cmake .. -DPARALLEL_RSP_M64P_PLUGIN=ON -DPARALLEL_RSP_DEBUG_JIT=OFF -DPARALLEL_RSP_TESTS=OFF \
 #            -DM64P_API_INCLUDE_DIR=<mupen64plus-core>/src/api -DCMAKE_BUILD_TYPE=Release
 option(PARALLEL_RSP_M64P_PLUGIN "Build the Mupen64Plus RSP plugin." OFF)
-set(M64P_API_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../mupen64plus-core/src/api" CACHE PATH
+set(M64P_API_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../mupen64plus-core-dento/src/api" CACHE PATH
     "Directory with m64p_types.h / m64p_plugin.h")
 
 if (PARALLEL_RSP_M64P_PLUGIN AND NOT WIN32)

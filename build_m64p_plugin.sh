@@ -3,7 +3,7 @@
 #   ./build_m64p_plugin.sh            native build        -> build-m64p/mupen64plus-rsp-parallel.so
 #   ./build_m64p_plugin.sh aarch64    cross build for aarch64 Linux (aarch64-linux-gnu-g++)
 #                                     -> build-m64p-aarch64/mupen64plus-rsp-parallel.so
-# M64P_API_INCLUDE_DIR may point at the directory holding m64p_types.h (default ../mupen64plus-core/src/api).
+# M64P_API_INCLUDE_DIR may point at the directory holding m64p_types.h (default ../../../mupen64plus-core-dento/src/api).
 set -e
 cd "$(dirname "$0")"
 DIR=build-m64p
